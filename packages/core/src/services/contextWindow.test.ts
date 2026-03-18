@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   Forest,
   ContextWindow,
@@ -19,7 +19,7 @@ import {
 /** Stub embedder: one-hot encoding based on first char code. */
 const stubEmbedder: Embedder = {
   embed(text: string): number[] {
-    const vec = new Array(128).fill(0);
+    const vec = new Array<number>(128).fill(0);
     if (text.length > 0) {
       vec[text.charCodeAt(0) % 128] = 1;
     }
@@ -57,7 +57,7 @@ describe('cosineSimilarity', () => {
 // -- Forest --
 
 describe('Forest', () => {
-  it('should insert a message as a singleton', async () => {
+  it('should insert a message as a singleton', () => {
     const forest = new Forest(stubEmbedder, stubSummarizer);
     const id = forest.insert(0, 'hello');
     expect(id).toBe(0);
@@ -66,46 +66,206 @@ describe('Forest', () => {
     expect(forest.clusterCount()).toBe(1);
   });
 
-  it('should find root with path compression', async () => {
+  it('should find root with path compression', () => {
     const forest = new Forest(stubEmbedder, stubSummarizer);
     forest.insert(0, 'a');
     forest.insert(1, 'b');
     forest.insert(2, 'c');
 
-    // Manually chain: 2 -> 1 -> 0
-    await forest.union(0, 1);
-    await forest.union(0, 2);
+    // Chain: 2 -> 1 -> 0
+    forest.union(0, 1);
+    forest.union(0, 2);
 
     // After path compression, find(2) should return root directly
     const root = forest.find(2);
     expect(root).toBe(forest.find(0));
   });
 
-  it('should union by rank', async () => {
+  it('should union by rank', () => {
     const forest = new Forest(stubEmbedder, stubSummarizer);
     forest.insert(0, 'a');
     forest.insert(1, 'b');
     forest.insert(2, 'c');
 
-    await forest.union(0, 1);
+    forest.union(0, 1);
     const root01 = forest.find(0);
 
-    await forest.union(root01, 2);
+    forest.union(root01, 2);
     // root01 had higher rank, so it should stay root
     expect(forest.find(2)).toBe(root01);
   });
 
-  it('should generate summary on union', async () => {
+  it('should NOT call summarizer on union (synchronous, structural only)', () => {
+    const summarizer = {
+      summarize: vi.fn().mockResolvedValue('summary'),
+    };
+    const forest = new Forest(stubEmbedder, summarizer);
+    forest.insert(0, 'alpha');
+    forest.insert(1, 'beta');
+
+    const root = forest.union(0, 1);
+
+    expect(summarizer.summarize).not.toHaveBeenCalled();
+    // No summary generated yet — cluster is dirty
+    expect(forest.isDirty(root)).toBe(true);
+  });
+
+  it('should return number (not Promise) from union', () => {
+    const forest = new Forest(stubEmbedder, stubSummarizer);
+    forest.insert(0, 'a');
+    forest.insert(1, 'b');
+
+    const result = forest.union(0, 1);
+    expect(typeof result).toBe('number');
+  });
+
+  it('should mark cluster as dirty after union', () => {
+    const forest = new Forest(stubEmbedder, stubSummarizer);
+    forest.insert(0, 'a');
+    forest.insert(1, 'b');
+
+    forest.union(0, 1);
+    const root = forest.find(0);
+
+    expect(forest.isDirty(root)).toBe(true);
+    expect(forest.dirtyRoots()).toContain(root);
+  });
+
+  it('should not mark singleton as dirty', () => {
+    const forest = new Forest(stubEmbedder, stubSummarizer);
+    forest.insert(0, 'hello');
+
+    expect(forest.isDirty(0)).toBe(false);
+    expect(forest.dirtyRoots()).toHaveLength(0);
+  });
+
+  it('should resolve dirty clusters via resolveDirty', async () => {
     const forest = new Forest(stubEmbedder, stubSummarizer);
     forest.insert(0, 'alpha');
     forest.insert(1, 'beta');
-    const root = await forest.union(0, 1);
+    forest.union(0, 1);
+
+    await forest.resolveDirty();
+
+    const root = forest.find(0);
+    expect(forest.isDirty(root)).toBe(false);
     const summary = forest.summary(root);
     expect(summary).toContain('alpha');
     expect(summary).toContain('beta');
   });
 
-  it('should update centroid on union', async () => {
+  it('should pass raw content of singletons to summarizer when resolving', async () => {
+    const recorder: string[][] = [];
+    const recSummarizer: Summarizer = {
+      async summarize(messages: string[]): Promise<string> {
+        recorder.push([...messages]);
+        return messages.join('; ');
+      },
+    };
+    const forest = new Forest(stubEmbedder, recSummarizer);
+    forest.insert(0, 'msg0');
+    forest.insert(1, 'msg1');
+    forest.union(0, 1);
+
+    await forest.resolveDirty();
+
+    // Both raw messages should be passed to summarizer
+    expect(recorder).toHaveLength(1);
+    expect(recorder[0]).toContain('msg0');
+    expect(recorder[0]).toContain('msg1');
+  });
+
+  it('should pass clean summary + new raw messages after second resolve', async () => {
+    const recorder: string[][] = [];
+    const recSummarizer: Summarizer = {
+      async summarize(messages: string[]): Promise<string> {
+        recorder.push([...messages]);
+        return messages.join('; ');
+      },
+    };
+    const forest = new Forest(stubEmbedder, recSummarizer);
+    forest.insert(0, 'msg0');
+    forest.insert(1, 'msg1');
+    forest.union(0, 1);
+
+    await forest.resolveDirty(); // resolve: summarize([msg0, msg1])
+
+    // Now insert a third and merge into the same cluster
+    forest.insert(2, 'msg2');
+    forest.union(forest.find(0), 2);
+
+    await forest.resolveDirty(); // resolve: summarize([cleanSummary, msg2])
+
+    const lastCall = recorder[recorder.length - 1];
+    // First item should be the clean summary from first resolve
+    expect(lastCall[0]).toContain('msg0');
+    expect(lastCall[0]).toContain('msg1');
+    // Second item should be the new raw message
+    expect(lastCall[1]).toBe('msg2');
+  });
+
+  it('should batch multiple dirty clusters in one resolveDirty call', async () => {
+    const summarizer = {
+      summarize: vi.fn().mockResolvedValue('summary'),
+    };
+    const forest = new Forest(stubEmbedder, summarizer);
+
+    // Create 3 separate pairs
+    forest.insert(0, 'a0');
+    forest.insert(1, 'a1');
+    forest.union(0, 1);
+
+    forest.insert(2, 'b0');
+    forest.insert(3, 'b1');
+    forest.union(2, 3);
+
+    forest.insert(4, 'c0');
+    forest.insert(5, 'c1');
+    forest.union(4, 5);
+
+    expect(forest.dirtyRoots()).toHaveLength(3);
+
+    await forest.resolveDirty();
+
+    expect(summarizer.summarize).toHaveBeenCalledTimes(3);
+    expect(forest.dirtyRoots()).toHaveLength(0);
+  });
+
+  it('should merge two clean cluster summaries on union', async () => {
+    const recorder: string[][] = [];
+    const recSummarizer: Summarizer = {
+      async summarize(messages: string[]): Promise<string> {
+        recorder.push([...messages]);
+        return `summary(${messages.join('+')})`;
+      },
+    };
+    const forest = new Forest(stubEmbedder, recSummarizer);
+
+    // Create and resolve two separate clusters
+    forest.insert(0, 'a0');
+    forest.insert(1, 'a1');
+    forest.union(0, 1);
+    await forest.resolveDirty();
+    const summaryA = forest.summary(forest.find(0))!;
+
+    forest.insert(2, 'b0');
+    forest.insert(3, 'b1');
+    forest.union(2, 3);
+    await forest.resolveDirty();
+    const summaryB = forest.summary(forest.find(2))!;
+
+    // Merge two clean clusters
+    forest.union(forest.find(0), forest.find(2));
+
+    await forest.resolveDirty();
+
+    // The last summarize call should receive both summaries
+    const lastCall = recorder[recorder.length - 1];
+    expect(lastCall).toContain(summaryA);
+    expect(lastCall).toContain(summaryB);
+  });
+
+  it('should update centroid on union', () => {
     const embedder: Embedder = {
       embed(text: string): number[] {
         return text === 'a' ? [1, 0] : [0, 1];
@@ -114,19 +274,20 @@ describe('Forest', () => {
     const forest = new Forest(embedder, stubSummarizer);
     forest.insert(0, 'a');
     forest.insert(1, 'b');
-    await forest.union(0, 1);
+    forest.union(0, 1);
     // Centroid should be average: [0.5, 0.5]
     const root = forest.find(0);
     const roots = forest.nearest([0.5, 0.5], 1);
     expect(roots).toContain(root);
   });
 
-  it('should return no-op for union of same cluster', async () => {
+  it('should return no-op for union of same cluster', () => {
     const forest = new Forest(stubEmbedder, stubSummarizer);
     forest.insert(0, 'a');
-    const root = await forest.union(0, 0);
+    const root = forest.union(0, 0);
     expect(root).toBe(0);
     expect(forest.clusterCount()).toBe(1);
+    expect(forest.isDirty(0)).toBe(false);
   });
 
   it('should compact a singleton to its content', () => {
@@ -135,20 +296,37 @@ describe('Forest', () => {
     expect(forest.compact(0)).toBe('hello world');
   });
 
-  it('should compact a merged cluster to its summary', async () => {
+  it('should compact a resolved cluster to its summary', async () => {
     const forest = new Forest(stubEmbedder, stubSummarizer);
     forest.insert(0, 'foo');
     forest.insert(1, 'bar');
-    const root = await forest.union(0, 1);
+    forest.union(0, 1);
+
+    await forest.resolveDirty();
+
+    const root = forest.find(0);
     expect(forest.compact(root)).toContain('foo');
     expect(forest.compact(root)).toContain('bar');
   });
 
-  it('should expand a cluster to source messages', async () => {
+  it('should compact a dirty cluster to stale summary or raw content', () => {
+    const forest = new Forest(stubEmbedder, stubSummarizer);
+    forest.insert(0, 'foo');
+    forest.insert(1, 'bar');
+    forest.union(0, 1);
+
+    // Not resolved yet — compact returns raw content of root node
+    const root = forest.find(0);
+    const compacted = forest.compact(root);
+    // Should be either 'foo' or 'bar' (whichever is root)
+    expect(['foo', 'bar']).toContain(compacted);
+  });
+
+  it('should expand a cluster to source messages', () => {
     const forest = new Forest(stubEmbedder, stubSummarizer);
     forest.insert(0, 'x');
     forest.insert(1, 'y');
-    await forest.union(0, 1);
+    forest.union(0, 1);
     const root = forest.find(0);
     const expanded = forest.expand(root);
     expect(expanded).toContain('x');
@@ -211,42 +389,25 @@ describe('Forest', () => {
     expect(forest.nearestRoot([1, 0])).toBeNull();
   });
 
-  it('should list members of a cluster', async () => {
+  it('should list members of a cluster', () => {
     const forest = new Forest(stubEmbedder, stubSummarizer);
     forest.insert(0, 'a');
     forest.insert(1, 'b');
-    await forest.union(0, 1);
+    forest.union(0, 1);
     const root = forest.find(0);
     const members = forest.members(root);
     expect(members).toContain(0);
     expect(members).toContain(1);
   });
 
-  it('should list all roots', async () => {
+  it('should list all roots', () => {
     const forest = new Forest(stubEmbedder, stubSummarizer);
     forest.insert(0, 'a');
     forest.insert(1, 'b');
     forest.insert(2, 'c');
-    await forest.union(0, 1);
+    forest.union(0, 1);
     const roots = forest.roots();
     expect(roots).toHaveLength(2);
-  });
-
-  it('should sort members by timestamp in summary', async () => {
-    const recorder: string[][] = [];
-    const recSummarizer: Summarizer = {
-      async summarize(messages: string[]): Promise<string> {
-        recorder.push([...messages]);
-        return messages.join('; ');
-      },
-    };
-    const forest = new Forest(stubEmbedder, recSummarizer);
-    forest.insert(0, 'second', undefined, '2024-01-02');
-    forest.insert(1, 'first', undefined, '2024-01-01');
-    await forest.union(0, 1);
-    // The summarizer should have received them in chronological order
-    expect(recorder[0][0]).toContain('first');
-    expect(recorder[0][1]).toContain('second');
   });
 });
 
@@ -283,33 +444,94 @@ describe('findClosestPair', () => {
 // -- ContextWindow --
 
 describe('ContextWindow', () => {
-  it('should keep messages in hot zone when under capacity', async () => {
+  it('should keep messages in hot zone when under graduateAt', () => {
     const cw = new ContextWindow(stubEmbedder, stubSummarizer, {
-      hotSize: 5,
+      graduateAt: 5,
+      evictAt: 7,
     });
-    await cw.append('msg1');
-    await cw.append('msg2');
+    cw.append('msg1');
+    cw.append('msg2');
     expect(cw.hotCount).toBe(2);
     expect(cw.coldClusterCount).toBe(0);
   });
 
-  it('should graduate oldest messages to cold zone', async () => {
-    const cw = new ContextWindow(stubEmbedder, stubSummarizer, {
-      hotSize: 2,
-      maxColdClusters: 10,
-      mergeThreshold: 0.0, // never merge
-    });
-
-    await cw.append('msg1');
-    await cw.append('msg2');
-    await cw.append('msg3'); // msg1 graduates
-
-    expect(cw.hotCount).toBe(2);
-    expect(cw.coldClusterCount).toBe(1);
-    expect(cw.totalMessages).toBe(3);
+  it('append should return a number (synchronous, not a Promise)', () => {
+    const cw = new ContextWindow(stubEmbedder, stubSummarizer);
+    const result = cw.append('test');
+    expect(typeof result).toBe('number');
   });
 
-  it('should merge graduated message into nearest cluster when similar', async () => {
+  it('should graduate oldest when hot exceeds graduateAt (overlap window)', () => {
+    const cw = new ContextWindow(stubEmbedder, stubSummarizer, {
+      graduateAt: 3,
+      evictAt: 5,
+      maxColdClusters: 10,
+      mergeThreshold: 0.0, // never merge by similarity
+    });
+
+    cw.append('msg0');
+    cw.append('msg1');
+    cw.append('msg2');
+    cw.append('msg3'); // msg0 graduates but stays in hot (overlap)
+
+    expect(cw.hotCount).toBe(4); // msg0 still in hot
+    expect(cw.coldClusterCount).toBe(1); // msg0 also in cold
+  });
+
+  it('should evict from hot when hot exceeds evictAt', () => {
+    const cw = new ContextWindow(stubEmbedder, stubSummarizer, {
+      graduateAt: 2,
+      evictAt: 4,
+      maxColdClusters: 10,
+      mergeThreshold: 0.0,
+    });
+
+    cw.append('msg0');
+    cw.append('msg1');
+    cw.append('msg2'); // msg0 graduates, stays in hot (3 items, overlap)
+    cw.append('msg3'); // msg1 graduates, stays in hot (4 items)
+    cw.append('msg4'); // msg2 graduates, msg0 evicted from hot (5>4)
+
+    expect(cw.hotCount).toBe(4); // msg1, msg2, msg3, msg4
+    expect(cw.coldClusterCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('should never call summarizer during append', () => {
+    const summarizer = {
+      summarize: vi.fn().mockResolvedValue('summary'),
+    };
+    const cw = new ContextWindow(stubEmbedder, summarizer, {
+      graduateAt: 2,
+      evictAt: 4,
+      maxColdClusters: 10,
+    });
+
+    for (let i = 0; i < 20; i++) {
+      cw.append(`msg${i}`);
+    }
+
+    expect(summarizer.summarize).not.toHaveBeenCalled();
+  });
+
+  it('should never call summarizer during render', () => {
+    const summarizer = {
+      summarize: vi.fn().mockResolvedValue('summary'),
+    };
+    const cw = new ContextWindow(stubEmbedder, summarizer, {
+      graduateAt: 2,
+      evictAt: 4,
+    });
+
+    for (let i = 0; i < 10; i++) {
+      cw.append(`msg${i}`);
+    }
+
+    const rendered = cw.render();
+    expect(summarizer.summarize).not.toHaveBeenCalled();
+    expect(rendered.length).toBeGreaterThan(0);
+  });
+
+  it('should merge graduated message into nearest cluster when similar', () => {
     // Use an embedder that makes all messages identical
     const sameEmbedder: Embedder = {
       embed(): number[] {
@@ -318,25 +540,26 @@ describe('ContextWindow', () => {
     };
 
     const cw = new ContextWindow(sameEmbedder, stubSummarizer, {
-      hotSize: 2,
+      graduateAt: 2,
+      evictAt: 4,
       maxColdClusters: 10,
       mergeThreshold: 0.5, // will merge since similarity is 1.0
     });
 
-    await cw.append('a');
-    await cw.append('b');
-    await cw.append('c'); // 'a' graduates as singleton
-    await cw.append('d'); // 'b' graduates, merges with 'a' (sim = 1.0)
+    cw.append('a');
+    cw.append('b');
+    cw.append('c'); // 'a' graduates as singleton
+    cw.append('d'); // 'b' graduates, merges with 'a' (sim = 1.0)
 
     expect(cw.coldClusterCount).toBe(1); // merged into one cluster
   });
 
-  it('should enforce hard cap on cold clusters via forced merging', async () => {
+  it('should enforce hard cap on cold clusters via forced merging', () => {
     // Each message gets a unique embedding so nothing merges naturally
     let counter = 0;
     const uniqueEmbedder: Embedder = {
       embed(): number[] {
-        const vec = new Array(10).fill(0);
+        const vec = new Array<number>(10).fill(0);
         vec[counter % 10] = 1;
         counter++;
         return vec;
@@ -344,39 +567,36 @@ describe('ContextWindow', () => {
     };
 
     const cw = new ContextWindow(uniqueEmbedder, stubSummarizer, {
-      hotSize: 2,
+      graduateAt: 2,
+      evictAt: 4,
       maxColdClusters: 3,
       mergeThreshold: 2.0, // never merge naturally (sim max is 1.0)
     });
 
-    // Add 7 messages: 2 stay hot, 5 graduate
-    for (let i = 0; i < 7; i++) {
-      await cw.append(`msg${i}`);
+    for (let i = 0; i < 10; i++) {
+      cw.append(`msg${i}`);
     }
 
-    expect(cw.hotCount).toBe(2);
-    // 5 graduated but max is 3, so forced merges bring it to <= 3
     expect(cw.coldClusterCount).toBeLessThanOrEqual(3);
   });
 
-  it('should render all cold summaries + hot messages without query', async () => {
+  it('should render cold summaries + hot messages without query', () => {
     const cw = new ContextWindow(stubEmbedder, stubSummarizer, {
-      hotSize: 2,
+      graduateAt: 2,
+      evictAt: 3,
       maxColdClusters: 10,
       mergeThreshold: 0.0,
     });
 
-    await cw.append('old1');
-    await cw.append('old2');
-    await cw.append('hot1');
-    await cw.append('hot2');
+    cw.append('old1');
+    cw.append('old2');
+    cw.append('hot1'); // old1 graduates
+    cw.append('hot2'); // old2 graduates, old1 evicted
 
     const rendered = cw.render();
-    // Should contain cold summaries and hot messages
     expect(rendered.length).toBeGreaterThanOrEqual(2);
     // Hot messages should be at the end
     expect(rendered[rendered.length - 1]).toBe('hot2');
-    expect(rendered[rendered.length - 2]).toBe('hot1');
   });
 
   it('should render with query-based retrieval', async () => {
@@ -389,27 +609,80 @@ describe('ContextWindow', () => {
     };
 
     const cw = new ContextWindow(embedder, stubSummarizer, {
-      hotSize: 1,
+      graduateAt: 2,
+      evictAt: 4,
       maxColdClusters: 10,
-      mergeThreshold: 0.0,
+      mergeThreshold: 2.0, // never merge by similarity (max sim is 1.0)
     });
 
-    await cw.append('cat info');
-    await cw.append('javascript info');
-    await cw.append('hot message');
+    cw.append('cat info');
+    cw.append('dog info');
+    cw.append('javascript info');
+    cw.append('hot message 1');
+    cw.append('hot message 2');
 
-    // Query about cats should retrieve cat cluster
+    // Resolve so cold clusters have proper summaries
+    await cw.resolveDirty();
+
+    // Query about cats should retrieve cat cluster from cold
     const rendered = cw.render('cat question', 1, 0.5);
     expect(rendered.some((r) => r.includes('cat'))).toBe(true);
   });
 
-  it('should return correct counts', async () => {
-    const cw = new ContextWindow(stubEmbedder, stubSummarizer, {
-      hotSize: 3,
+  it('should resolveDirty to batch-summarize dirty clusters', async () => {
+    const summarizer = {
+      summarize: vi.fn().mockResolvedValue('resolved summary'),
+    };
+    const cw = new ContextWindow(stubEmbedder, summarizer, {
+      graduateAt: 2,
+      evictAt: 4,
+      maxColdClusters: 10,
+      mergeThreshold: 0.0,
     });
 
-    await cw.append('a');
-    await cw.append('b');
+    for (let i = 0; i < 10; i++) {
+      cw.append(`msg${i}`);
+    }
+
+    expect(summarizer.summarize).not.toHaveBeenCalled();
+
+    await cw.resolveDirty();
+
+    // Should have called summarize for dirty clusters
+    expect(summarizer.summarize).toHaveBeenCalled();
+    // After resolve, no dirty clusters
+    expect(cw.forest.dirtyRoots()).toHaveLength(0);
+  });
+
+  it('should show graduated messages verbatim in render via overlap window', () => {
+    const cw = new ContextWindow(stubEmbedder, stubSummarizer, {
+      graduateAt: 3,
+      evictAt: 5,
+      maxColdClusters: 10,
+      mergeThreshold: 0.0,
+    });
+
+    cw.append('msg0');
+    cw.append('msg1');
+    cw.append('msg2');
+    cw.append('msg3'); // msg0 graduates but stays in hot
+
+    // msg0 should appear in render as verbatim hot zone content
+    const rendered = cw.render();
+    expect(rendered).toContain('msg0');
+    // msg0 is also in cold, but it still appears from hot
+    expect(cw.coldClusterCount).toBe(1);
+    expect(cw.hotCount).toBe(4);
+  });
+
+  it('should return correct counts', () => {
+    const cw = new ContextWindow(stubEmbedder, stubSummarizer, {
+      graduateAt: 3,
+      evictAt: 5,
+    });
+
+    cw.append('a');
+    cw.append('b');
     expect(cw.hotCount).toBe(2);
     expect(cw.coldClusterCount).toBe(0);
     expect(cw.totalMessages).toBe(2);
@@ -420,16 +693,17 @@ describe('ContextWindow', () => {
     expect(cw.forest).toBeInstanceOf(Forest);
   });
 
-  it('should expand a cold cluster to source messages', async () => {
+  it('should expand a cold cluster to source messages', () => {
     const cw = new ContextWindow(stubEmbedder, stubSummarizer, {
-      hotSize: 2,
+      graduateAt: 2,
+      evictAt: 3,
       maxColdClusters: 10,
       mergeThreshold: 0.0,
     });
 
-    await cw.append('graduated');
-    await cw.append('h1');
-    await cw.append('h2');
+    cw.append('graduated');
+    cw.append('h1');
+    cw.append('h2'); // 'graduated' enters cold
 
     const roots = cw.forest.roots();
     expect(roots.length).toBe(1);

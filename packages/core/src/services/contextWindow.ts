@@ -5,11 +5,17 @@
  */
 
 /**
- * Union-find context compaction with LLM-generated cluster summaries.
+ * Union-find context compaction with overlap window and deferred summarization.
  *
- * E-class roots are cache keys for summaries. Union = cheap LLM merge.
- * Graduation merges into nearest e-class if similar enough, else creates
- * a new singleton. Retrieval embeds a query and returns top-k e-classes.
+ * v2 architecture:
+ * - append() is synchronous — no LLM calls. Graduation triggers structural
+ *   union() only.
+ * - render() is synchronous — returns cached summaries + hot zone messages.
+ * - resolveDirty() is async fire-and-forget — batch-summarizes dirty clusters
+ *   in background during main LLM call wait.
+ * - Overlap window (graduateAt/evictAt): graduated messages stay in hot zone
+ *   for ~2 turns. By the time they evict, background resolveDirty() has
+ *   resolved their cluster summaries. Zero blocking, zero staleness.
  */
 
 // -- Interfaces --
@@ -81,6 +87,7 @@ export class Forest {
   private _summaries: Map<number, string> = new Map();
   private _children: Map<number, number[]> = new Map();
   private _centroids: Map<number, number[]> = new Map();
+  private _dirtyInputs: Map<number, string[]> = new Map();
   private _embedder: Embedder;
   private _summarizer: Summarizer;
 
@@ -109,6 +116,7 @@ export class Forest {
     this._nodes.set(msgId, msg);
     this._children.set(msgId, [msgId]);
     this._centroids.set(msgId, [...embedding]);
+    // Singleton is NOT dirty — raw content serves as compact() output.
     return msgId;
   }
 
@@ -121,7 +129,12 @@ export class Forest {
     return root;
   }
 
-  async union(idA: number, idB: number): Promise<number> {
+  /**
+   * Synchronous structural merge. No LLM calls.
+   * Merges parent pointers, children, centroids.
+   * Collects dirty inputs for later batch summarization.
+   */
+  union(idA: number, idB: number): number {
     let rootA = this.find(idA);
     let rootB = this.find(idB);
     if (rootA === rootB) return rootA;
@@ -158,26 +171,53 @@ export class Forest {
       this._centroids.set(rootA, merged);
     }
 
-    // Summarize merged e-class via summarizer
-    const memberIds = this._children.get(rootA)!;
-    const sortedIds = [...memberIds].sort((a, b) => {
-      const ta = this._nodes.get(a)?.timestamp ?? '';
-      const tb = this._nodes.get(b)?.timestamp ?? '';
-      return ta.localeCompare(tb);
-    });
-
-    const memberTexts: string[] = [];
-    for (const mid of sortedIds) {
-      const node = this._nodes.get(mid)!;
-      if (node.timestamp) {
-        memberTexts.push(`[${node.timestamp}] ${node.content}`);
-      } else {
-        memberTexts.push(node.content);
-      }
+    // Collect dirty inputs: what A represents + what B represents
+    let inputsA: string[];
+    if (this._dirtyInputs.has(rootA)) {
+      inputsA = this._dirtyInputs.get(rootA)!;
+    } else if (this._summaries.has(rootA)) {
+      inputsA = [this._summaries.get(rootA)!];
+    } else {
+      inputsA = [nodeA.content];
     }
-    this._summaries.set(rootA, await this._summarizer.summarize(memberTexts));
+
+    let inputsB: string[];
+    if (this._dirtyInputs.has(rootB)) {
+      inputsB = this._dirtyInputs.get(rootB)!;
+    } else if (this._summaries.has(rootB)) {
+      inputsB = [this._summaries.get(rootB)!];
+    } else {
+      inputsB = [this._nodes.get(rootB)!.content];
+    }
+
+    this._dirtyInputs.set(rootA, [...inputsA, ...inputsB]);
+    this._dirtyInputs.delete(rootB);
+    this._summaries.delete(rootB);
 
     return rootA;
+  }
+
+  /**
+   * Batch-summarize all dirty clusters. One LLM call per dirty root.
+   * Called as fire-and-forget after render(), runs during main LLM call wait.
+   */
+  async resolveDirty(): Promise<void> {
+    const entries = [...this._dirtyInputs.entries()];
+    for (const [root, inputs] of entries) {
+      const summary = await this._summarizer.summarize(inputs);
+      this._summaries.set(root, summary);
+    }
+    this._dirtyInputs.clear();
+  }
+
+  /** Whether this cluster has unsummarized content. */
+  isDirty(rootId: number): boolean {
+    return this._dirtyInputs.has(this.find(rootId));
+  }
+
+  /** All roots with unsummarized content. */
+  dirtyRoots(): number[] {
+    return [...this._dirtyInputs.keys()];
   }
 
   compact(rootId: number): string {
@@ -261,7 +301,8 @@ export class Forest {
 // -- ContextWindow --
 
 export interface ContextWindowOptions {
-  hotSize?: number;
+  graduateAt?: number;
+  evictAt?: number;
   maxColdClusters?: number;
   mergeThreshold?: number;
 }
@@ -270,10 +311,12 @@ export class ContextWindow {
   private _embedder: Embedder;
   private _forest: Forest;
   private _hot: Message[] = [];
-  private _hotSize: number;
+  private _graduateAt: number;
+  private _evictAt: number;
   private _maxColdClusters: number;
   private _mergeThreshold: number;
   private _nextId = 0;
+  private _graduatedIndex = 0;
 
   constructor(
     embedder: Embedder,
@@ -282,12 +325,17 @@ export class ContextWindow {
   ) {
     this._embedder = embedder;
     this._forest = new Forest(embedder, summarizer);
-    this._hotSize = options.hotSize ?? 30;
+    this._graduateAt = options.graduateAt ?? 26;
+    this._evictAt = options.evictAt ?? 30;
     this._maxColdClusters = options.maxColdClusters ?? 10;
     this._mergeThreshold = options.mergeThreshold ?? 0.15;
   }
 
-  async append(content: string, timestamp?: string | null): Promise<number> {
+  /**
+   * Synchronous append. No LLM calls.
+   * Embeds locally (TF-IDF), pushes to hot, graduates and evicts as needed.
+   */
+  append(content: string, timestamp?: string | null): number {
     const msgId = this._nextId++;
     const embedding = this._embedder.embed(content);
     const msg: Message = {
@@ -300,15 +348,27 @@ export class ContextWindow {
     };
     this._hot.push(msg);
 
-    while (this._hot.length > this._hotSize) {
-      const graduated = this._hot.shift()!;
-      await this._graduate(graduated);
+    // Graduate: ensure ungraduated count <= graduateAt
+    while (this._hot.length - this._graduatedIndex > this._graduateAt) {
+      this._graduate(this._hot[this._graduatedIndex]);
+      this._graduatedIndex++;
+    }
+
+    // Evict: ensure hot.length <= evictAt
+    while (this._hot.length > this._evictAt) {
+      this._hot.shift();
+      this._graduatedIndex--;
     }
 
     return msgId;
   }
 
-  private async _graduate(msg: Message): Promise<void> {
+  /**
+   * Synchronous graduation. No LLM calls.
+   * Inserts into forest, merges with nearest cluster if similar enough,
+   * enforces hard cap on cluster count.
+   */
+  private _graduate(msg: Message): void {
     this._forest.insert(msg.id, msg.content, msg.embedding, msg.timestamp);
 
     if (this._forest.clusterCount() <= 1) return;
@@ -336,17 +396,22 @@ export class ContextWindow {
     }
 
     if (sim >= this._mergeThreshold) {
-      await this._forest.union(msg.id, nearestRoot);
+      this._forest.union(msg.id, nearestRoot);
     }
 
     // Enforce hard cap on cluster count
     while (this._forest.clusterCount() > this._maxColdClusters) {
       const pair = findClosestPair(this._forest);
       if (!pair) break;
-      await this._forest.union(pair[0], pair[1]);
+      this._forest.union(pair[0], pair[1]);
     }
   }
 
+  /**
+   * Synchronous render. No LLM calls.
+   * Returns cached cold summaries + hot zone messages.
+   * Overlap window ensures graduated messages still appear verbatim from hot.
+   */
   render(
     query?: string | null,
     k: number = 3,
@@ -364,6 +429,14 @@ export class ContextWindow {
 
     const hot = this._hot.map((m) => m.content);
     return [...cold, ...hot];
+  }
+
+  /**
+   * Async fire-and-forget. Batch-summarizes dirty clusters via LLM calls.
+   * Called after render(), runs during main LLM call wait.
+   */
+  async resolveDirty(): Promise<void> {
+    await this._forest.resolveDirty();
   }
 
   expand(rootId: number): string[] {

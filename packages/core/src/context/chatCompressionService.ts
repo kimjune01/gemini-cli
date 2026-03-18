@@ -162,13 +162,11 @@ async function truncateHistoryToBudget(
           } else if (responseObj && typeof responseObj === 'object') {
             if (
               'output' in responseObj &&
-               
               typeof responseObj['output'] === 'string'
             ) {
               contentStr = responseObj['output'];
             } else if (
               'content' in responseObj &&
-               
               typeof responseObj['content'] === 'string'
             ) {
               contentStr = responseObj['content'];
@@ -237,8 +235,11 @@ async function truncateHistoryToBudget(
   return truncatedHistory;
 }
 
-/** Number of messages kept verbatim in the hot zone. */
-const UNION_FIND_HOT_SIZE = 30;
+/** Start graduating messages when hot zone exceeds this count. */
+const UNION_FIND_GRADUATE_AT = 26;
+
+/** Evict oldest from hot zone when it exceeds this count. */
+const UNION_FIND_EVICT_AT = 30;
 
 /** Maximum number of clusters in the cold zone. */
 const UNION_FIND_MAX_COLD_CLUSTERS = 10;
@@ -610,7 +611,8 @@ export class ChatCompressionService {
       modelStringToModelConfigAlias(model),
     );
     const contextWindow = new ContextWindow(embedder, summarizer, {
-      hotSize: UNION_FIND_HOT_SIZE,
+      graduateAt: UNION_FIND_GRADUATE_AT,
+      evictAt: UNION_FIND_EVICT_AT,
       maxColdClusters: UNION_FIND_MAX_COLD_CLUSTERS,
       mergeThreshold: UNION_FIND_MERGE_THRESHOLD,
     });
@@ -628,16 +630,21 @@ export class ChatCompressionService {
         .join(' ')
         .trim();
       if (text) {
-        await contextWindow.append(text);
+        contextWindow.append(text);
       }
     }
 
-    // Render the compacted context
+    // Render the compacted context (synchronous — uses cached summaries)
     const rendered = contextWindow.render(
       null,
       UNION_FIND_RETRIEVE_K,
       UNION_FIND_RETRIEVE_MIN_SIM,
     );
+
+    // Fire-and-forget: resolve dirty clusters in background
+    // In production, this runs during the main LLM call wait.
+    // Here we await it since there's no concurrent main call.
+    await contextWindow.resolveDirty();
 
     // Build new history: cold summaries as a single user message, then hot messages
     const coldSummaries = rendered.slice(
