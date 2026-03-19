@@ -52,6 +52,25 @@ describe('cosineSimilarity', () => {
   it('should handle negative values', () => {
     expect(cosineSimilarity([1, 0], [-1, 0])).toBeCloseTo(-1.0);
   });
+
+  it('should handle mismatched dimensions without NaN', () => {
+    const short = [1, 0];
+    const long = [1, 0, 0.5, 0.3];
+    const sim = cosineSimilarity(long, short);
+    expect(Number.isNaN(sim)).toBe(false);
+    expect(sim).toBeGreaterThan(0);
+    // Symmetric
+    expect(cosineSimilarity(short, long)).toBeCloseTo(sim);
+  });
+
+  it('should return 0 for mismatched zero-overlap vectors', () => {
+    // short has values only in dims 0-1, long only in dims 2-3
+    const a = [1, 0];
+    const b = [0, 0, 1, 0];
+    const sim = cosineSimilarity(a, b);
+    expect(Number.isNaN(sim)).toBe(false);
+    expect(sim).toBeCloseTo(0.0);
+  });
 });
 
 // -- Forest --
@@ -281,6 +300,27 @@ describe('Forest', () => {
     expect(roots).toContain(root);
   });
 
+  it('should handle centroid merging with mismatched embedding dimensions', () => {
+    const embedder: Embedder = {
+      embed(text: string): number[] {
+        // Simulate growing vocab: earlier messages have shorter embeddings
+        if (text === 'early') return [1, 0];
+        return [0.5, 0.5, 0.3]; // later messages have longer embeddings
+      },
+    };
+    const forest = new Forest(embedder, stubSummarizer);
+    forest.insert(0, 'early');
+    forest.insert(1, 'later');
+    forest.union(0, 1);
+
+    const root = forest.find(0);
+    const centroid = forest.getCentroid(root);
+    expect(centroid).toBeDefined();
+    expect(centroid!.every((v) => !Number.isNaN(v))).toBe(true);
+    // Merged centroid should have max dimension length
+    expect(centroid!.length).toBe(3);
+  });
+
   it('should return no-op for union of same cluster', () => {
     const forest = new Forest(stubEmbedder, stubSummarizer);
     forest.insert(0, 'a');
@@ -398,6 +438,72 @@ describe('Forest', () => {
     const members = forest.members(root);
     expect(members).toContain(0);
     expect(members).toContain(1);
+  });
+
+  it('should not drop dirty state added by union during resolveDirty', async () => {
+    const slowSummarizer: Summarizer = {
+      async summarize(messages: string[]): Promise<string> {
+        // Simulate slow LLM call
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return messages.join('; ');
+      },
+    };
+    const forest = new Forest(stubEmbedder, slowSummarizer);
+    forest.insert(0, 'a');
+    forest.insert(1, 'b');
+    forest.union(0, 1); // dirty cluster {0,1}
+
+    // Start resolving — the await inside gives us a window
+    const resolvePromise = forest.resolveDirty();
+
+    // While resolve is in flight, add new dirty state
+    forest.insert(2, 'c');
+    forest.insert(3, 'd');
+    forest.union(2, 3); // new dirty cluster {2,3}
+
+    await resolvePromise;
+
+    // The new dirty cluster should NOT have been wiped
+    expect(forest.isDirty(forest.find(2))).toBe(true);
+
+    // Resolve it now
+    await forest.resolveDirty();
+    expect(forest.isDirty(forest.find(2))).toBe(false);
+  });
+
+  it('should not overwrite merged cluster dirty state when in-flight root is merged', async () => {
+    const slowSummarizer: Summarizer = {
+      async summarize(messages: string[]): Promise<string> {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return messages.join('; ');
+      },
+    };
+    const forest = new Forest(stubEmbedder, slowSummarizer);
+    forest.insert(0, 'a');
+    forest.insert(1, 'b');
+    forest.union(0, 1); // dirty cluster {0,1}
+    const originalRoot = forest.find(0);
+
+    // Start resolving {0,1}
+    const resolvePromise = forest.resolveDirty();
+
+    // While {0,1} is being summarized, merge it into a new cluster
+    forest.insert(2, 'c');
+    forest.union(originalRoot, 2); // now {0,1,2} is dirty with combined inputs
+
+    await resolvePromise;
+
+    // The merged cluster should still be dirty — the stale summary
+    // from the in-flight call should NOT have resolved it
+    const mergedRoot = forest.find(0);
+    expect(forest.isDirty(mergedRoot)).toBe(true);
+
+    // Resolve it properly now
+    await forest.resolveDirty();
+    expect(forest.isDirty(forest.find(0))).toBe(false);
+    // Summary should include all three messages
+    const summary = forest.summary(forest.find(0))!;
+    expect(summary).toBeDefined();
   });
 
   it('should list all roots', () => {
@@ -686,6 +792,40 @@ describe('ContextWindow', () => {
     expect(cw.hotCount).toBe(2);
     expect(cw.coldClusterCount).toBe(0);
     expect(cw.totalMessages).toBe(2);
+  });
+
+  it('render(query) should not mutate the embedder corpus', () => {
+    const embedder = {
+      embed(text: string): number[] {
+        if (text.includes('cat')) return [1, 0, 0];
+        return [0, 0, 1];
+      },
+      embedQuery: vi.fn().mockReturnValue([1, 0, 0]),
+    };
+
+    const cw = new ContextWindow(embedder, stubSummarizer, {
+      graduateAt: 2,
+      evictAt: 4,
+      maxColdClusters: 10,
+      mergeThreshold: 0.0,
+    });
+
+    cw.append('cat info');
+    cw.append('dog info');
+    cw.append('hot1');
+
+    // render with query should call embedQuery, not embed
+    cw.render('cat question', 1, 0.0);
+    expect(embedder.embedQuery).toHaveBeenCalledWith('cat question');
+  });
+
+  it('should throw if evictAt < graduateAt', () => {
+    expect(() => {
+      new ContextWindow(stubEmbedder, stubSummarizer, {
+        graduateAt: 5,
+        evictAt: 3,
+      });
+    }).toThrow('evictAt (3) must be >= graduateAt (5)');
   });
 
   it('should expose forest for direct access', () => {

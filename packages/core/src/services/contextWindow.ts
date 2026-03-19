@@ -7,6 +7,12 @@
 /**
  * Union-find context compaction with overlap window and deferred summarization.
  *
+ * Reading order for reviewers:
+ *   1. cosineSimilarity() — handles mismatched vector dimensions safely
+ *   2. Forest class — union-find with path compression, deferred summarization
+ *   3. ContextWindow class — overlap window, graduation/eviction
+ *   4. Integration: chatCompressionService.ts compactWithUnionFind()
+ *
  * v2 architecture:
  * - append() is synchronous — no LLM calls. Graduation triggers structural
  *   union() only.
@@ -15,13 +21,17 @@
  *   in background during main LLM call wait.
  * - Overlap window (graduateAt/evictAt): graduated messages stay in hot zone
  *   for ~2 turns. By the time they evict, background resolveDirty() has
- *   resolved their cluster summaries. Zero blocking, zero staleness.
+ *   resolved their cluster summaries.
+ *
+ * Design doc: https://github.com/kimjune01/union-find-compaction-for-gemini-cli/blob/main/transformation-design.md
  */
 
 // -- Interfaces --
 
 export interface Embedder {
   embed(text: string): number[];
+  /** Embed without mutating internal state. Used for queries/retrieval. */
+  embedQuery?(text: string): number[];
 }
 
 export interface Summarizer {
@@ -41,13 +51,25 @@ export interface Message {
 
 // -- Helpers --
 
+// TF-IDF vocabulary grows over time, so newer vectors are longer than older
+// ones. We handle mismatched dimensions by treating missing entries as zero:
+// only shared dimensions contribute to the dot product, but trailing dimensions
+// still contribute to the norm (lowering similarity, as expected).
 export function cosineSimilarity(a: number[], b: number[]): number {
+  const len = Math.min(a.length, b.length);
   let dot = 0;
   let normA = 0;
   let normB = 0;
-  for (let i = 0; i < a.length; i++) {
+  for (let i = 0; i < len; i++) {
     dot += a[i] * b[i];
     normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  // Include trailing dimensions from the longer vector in its norm
+  for (let i = len; i < a.length; i++) {
+    normA += a[i] * a[i];
+  }
+  for (let i = len; i < b.length; i++) {
     normB += b[i] * b[i];
   }
   normA = Math.sqrt(normA);
@@ -167,7 +189,12 @@ export class Forest {
     if (ca && cb) {
       const na = membersA.length - membersB.length;
       const nb = membersB.length;
-      const merged = ca.map((v, i) => (v * na + cb[i] * nb) / (na + nb));
+      const total = na + nb;
+      const maxLen = Math.max(ca.length, cb.length);
+      const merged = new Array<number>(maxLen);
+      for (let i = 0; i < maxLen; i++) {
+        merged[i] = ((ca[i] ?? 0) * na + (cb[i] ?? 0) * nb) / total;
+      }
       this._centroids.set(rootA, merged);
     }
 
@@ -200,14 +227,26 @@ export class Forest {
   /**
    * Batch-summarize all dirty clusters. One LLM call per dirty root.
    * Called as fire-and-forget after render(), runs during main LLM call wait.
+   *
+   * Concurrency safety: union() can run between awaits (JS is single-threaded
+   * but yields at each await). When union() merges into a dirty root, it
+   * replaces _dirtyInputs with a new array containing combined content.
+   * We detect this via reference equality (=== check on the inputs array).
+   * If the array changed, we skip — the combined entry resolves next call.
    */
   async resolveDirty(): Promise<void> {
     const entries = [...this._dirtyInputs.entries()];
     for (const [root, inputs] of entries) {
+      if (!this._dirtyInputs.has(root)) continue;
       const summary = await this._summarizer.summarize(inputs);
-      this._summaries.set(root, summary);
+      if (this._dirtyInputs.get(root) === inputs) {
+        this._summaries.set(root, summary);
+        this._dirtyInputs.delete(root);
+      }
+      // If union() replaced the inputs (merged new content into this root)
+      // or merged this root away, skip — the combined dirty entry will be
+      // resolved in a future resolveDirty() call.
     }
-    this._dirtyInputs.clear();
   }
 
   /** Whether this cluster has unsummarized content. */
@@ -329,6 +368,11 @@ export class ContextWindow {
     this._evictAt = options.evictAt ?? 30;
     this._maxColdClusters = options.maxColdClusters ?? 10;
     this._mergeThreshold = options.mergeThreshold ?? 0.15;
+    if (this._evictAt < this._graduateAt) {
+      throw new Error(
+        `evictAt (${this._evictAt}) must be >= graduateAt (${this._graduateAt})`,
+      );
+    }
   }
 
   /**
@@ -420,7 +464,10 @@ export class ContextWindow {
     let cold: string[];
 
     if (query != null && this._forest.clusterCount() > 0) {
-      const queryEmb = this._embedder.embed(query);
+      // Use embedQuery (non-mutating) to avoid contaminating the TF-IDF corpus.
+      // embed() would add query terms to the vocabulary, changing future embeddings.
+      const embedFn = this._embedder.embedQuery ?? this._embedder.embed;
+      const queryEmb = embedFn.call(this._embedder, query);
       const topRoots = this._forest.nearest(queryEmb, k, minSim);
       cold = topRoots.map((r) => this._forest.compact(r));
     } else {

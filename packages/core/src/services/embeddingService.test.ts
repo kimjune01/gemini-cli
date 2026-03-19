@@ -86,6 +86,32 @@ describe('TFIDFEmbedder', () => {
     }
   });
 
+  it('embedQuery should not mutate vocabulary or doc count', () => {
+    const embedder = new TFIDFEmbedder();
+    embedder.embed('alpha beta');
+    embedder.embed('gamma delta');
+    const vocabBefore = embedder.getVocabulary().length;
+
+    // embedQuery with new terms should not grow vocab
+    const qvec = embedder.embedQuery('epsilon zeta');
+    const vocabAfter = embedder.getVocabulary().length;
+
+    expect(vocabAfter).toBe(vocabBefore);
+    // Unknown terms should produce a zero vector (no known terms matched)
+    expect(qvec.every((v) => v === 0)).toBe(true);
+  });
+
+  it('embedQuery should use existing vocabulary for known terms', () => {
+    const embedder = new TFIDFEmbedder();
+    embedder.embed('cat dog fish');
+
+    const qvec = embedder.embedQuery('cat');
+    // Should produce non-zero vector since 'cat' is in vocab
+    expect(qvec.some((v) => v !== 0)).toBe(true);
+    // Same dimension as current vocab
+    expect(qvec.length).toBe(embedder.getVocabulary().length);
+  });
+
   it('should normalize vectors', () => {
     const embedder = new TFIDFEmbedder();
     const vec = embedder.embed('test normalization vector');
