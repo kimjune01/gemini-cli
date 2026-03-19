@@ -22,7 +22,7 @@ export class Message {
   ) {}
 }
 
-function cosineSimilarity(a: number[], b: number[]): number {
+export function cosineSimilarity(a: number[], b: number[]): number {
   const dimensions = Math.max(a.length, b.length);
   let dot = 0;
   let normA = 0;
@@ -150,16 +150,24 @@ export class Forest {
   }
 
   async resolveDirty(): Promise<void> {
-    if (this._resolvePromise) {
-      await this._resolvePromise;
-      return;
-    }
+    let ranOwnBatch = false;
 
-    this._resolvePromise = this._resolveDirtyBatch();
-    try {
-      await this._resolvePromise;
-    } finally {
-      this._resolvePromise = null;
+    while (true) {
+      if (this._resolvePromise) {
+        await this._resolvePromise;
+      } else {
+        this._resolvePromise = this._resolveDirtyBatch();
+        ranOwnBatch = true;
+        try {
+          await this._resolvePromise;
+        } finally {
+          this._resolvePromise = null;
+        }
+      }
+
+      if (this.dirtyRoots().length === 0 || ranOwnBatch) {
+        return;
+      }
     }
   }
 
@@ -317,7 +325,9 @@ export class ContextWindow {
     this._graduateAt = options.graduateAt ?? 26;
     this._evictAt = options.evictAt ?? 30;
     if (this._evictAt < this._graduateAt) {
-      throw new Error('evictAt must be greater than or equal to graduateAt');
+      throw new Error(
+        `evictAt (${this._evictAt}) must be >= graduateAt (${this._graduateAt})`,
+      );
     }
     this._maxColdClusters = options.maxColdClusters ?? 10;
     this._mergeThreshold = options.mergeThreshold ?? 0.15;

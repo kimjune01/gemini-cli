@@ -10,6 +10,21 @@ import type { BaseLlmClient } from '../core/baseLlmClient.js';
 import { ClusterSummarizer } from './clusterSummarizer.js';
 
 describe('ClusterSummarizer', () => {
+  it('returns an empty summary for empty input without calling the model', async () => {
+    const llmClient = {
+      generateContent: vi.fn(),
+    } as unknown as BaseLlmClient;
+
+    const summarizer = new ClusterSummarizer(
+      llmClient,
+      'chat-compression-3-pro',
+    );
+    const summary = await summarizer.summarize([]);
+
+    expect(summary).toBe('');
+    expect(llmClient.generateContent).not.toHaveBeenCalled();
+  });
+
   it('returns single messages without calling the model', async () => {
     const llmClient = {
       generateContent: vi.fn(),
@@ -42,6 +57,7 @@ describe('ClusterSummarizer', () => {
     expect(llmClient.generateContent).toHaveBeenCalledTimes(1);
     const request = vi.mocked(llmClient.generateContent).mock.calls[0][0];
     expect(request.modelConfigKey).toEqual({ model: 'chat-compression-3-pro' });
+    expect(request.contents[0].parts?.[0].text).toContain('tool results');
     expect(request.contents[0].parts?.[0].text).toContain('[1] msg 1');
     expect(request.contents[0].parts?.[0].text).toContain('[2] msg 2');
   });

@@ -792,6 +792,55 @@ describe('ChatCompressionService', () => {
         ),
       ).toBe(false);
     });
+
+    it('should fall back to truncation-only after a prior failed union-find summary attempt', async () => {
+      vi.mocked(mockConfig.getCompressionConfig).mockReturnValue({
+        strategy: 'union-find',
+        hotSize: 4,
+        maxColdClusters: 2,
+        mergeThreshold: 0.1,
+      });
+      vi.mocked(mockChat.getLastPromptTokenCount).mockReturnValue(600000);
+      vi.spyOn(tokenCalculation, 'estimateTokenCountSync').mockReturnValue(100);
+      vi.mocked(mockConfig.getTruncateToolOutputThreshold).mockReturnValue(10);
+      vi.mocked(mockChat.getHistory).mockReturnValue([
+        { role: 'user', parts: [{ text: 'msg 1' }] },
+        {
+          role: 'user',
+          parts: [
+            {
+              functionResponse: {
+                name: 'shell',
+                response: { output: 'this will be truncated' },
+              },
+            },
+          ],
+        },
+      ]);
+
+      const result = await service.compress(
+        mockChat,
+        mockPromptId,
+        false,
+        mockModel,
+        mockConfig,
+        true,
+      );
+
+      expect(result.info.compressionStatus).toBe(
+        CompressionStatus.CONTENT_TRUNCATED,
+      );
+      expect(result.newHistory).not.toBeNull();
+      expect(
+        result.newHistory?.some((content) =>
+          content.parts?.some((part) =>
+            part.functionResponse?.response?.['output']
+              ?.toString()
+              .includes('Output too large.'),
+          ),
+        ),
+      ).toBe(true);
+    });
   });
 
   describe('Reverse Token Budget Truncation', () => {

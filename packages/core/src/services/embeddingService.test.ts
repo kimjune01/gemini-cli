@@ -38,4 +38,26 @@ describe('TFIDFEmbedder', () => {
 
     expect(beta.length).toBe(2);
   });
+
+  it('ignores unknown query terms without growing the vector space', () => {
+    const embedder = new TFIDFEmbedder();
+
+    embedder.embed('alpha beta');
+    const queryVector = embedder.embedQuery('gamma');
+    const nextVector = embedder.embed('alpha');
+
+    expect(queryVector).toEqual([0, 0]);
+    expect(nextVector.length).toBe(2);
+  });
+
+  it('returns normalized vectors for non-empty inputs', () => {
+    const embedder = new TFIDFEmbedder();
+
+    const vector = embedder.embed('alpha alpha beta');
+    const norm = Math.sqrt(
+      vector.reduce((sum, value) => sum + value * value, 0),
+    );
+
+    expect(norm).toBeCloseTo(1);
+  });
 });
