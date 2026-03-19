@@ -177,6 +177,15 @@ export interface SummarizeToolOutputSettings {
   tokenBudget?: number;
 }
 
+export type CompressionStrategy = 'flat' | 'union-find';
+
+export interface CompressionConfig {
+  strategy?: CompressionStrategy;
+  hotSize?: number;
+  maxColdClusters?: number;
+  mergeThreshold?: number;
+}
+
 export interface PlanSettings {
   directory?: string;
   modelRouting?: boolean;
@@ -583,6 +592,7 @@ export interface ConfigParameters {
   importFormat?: 'tree' | 'flat';
   discoveryMaxDirs?: number;
   compressionThreshold?: number;
+  compressionConfig?: CompressionConfig;
   interactive?: boolean;
   trustedFolder?: boolean;
   useBackgroundColor?: boolean;
@@ -776,6 +786,7 @@ export class Config implements McpContext, AgentLoopContext {
   private readonly importFormat: 'tree' | 'flat';
   private readonly discoveryMaxDirs: number;
   private readonly compressionThreshold: number | undefined;
+  private readonly compressionConfig: CompressionConfig | undefined;
   /** Public for testing only */
   readonly interactive: boolean;
   private readonly ptyInfo: string;
@@ -1049,6 +1060,7 @@ export class Config implements McpContext, AgentLoopContext {
     this.importFormat = params.importFormat ?? 'tree';
     this.discoveryMaxDirs = params.discoveryMaxDirs ?? 200;
     this.compressionThreshold = params.compressionThreshold;
+    this.compressionConfig = params.compressionConfig;
     this.interactive = params.interactive ?? false;
     this.ptyInfo = params.ptyInfo ?? 'child_process';
     this.trustedFolder = params.trustedFolder;
@@ -2710,6 +2722,15 @@ export class Config implements McpContext, AgentLoopContext {
       return undefined;
     }
     return remoteThreshold;
+  }
+
+  getCompressionConfig(): Required<CompressionConfig> {
+    return {
+      strategy: this.compressionConfig?.strategy ?? 'flat',
+      hotSize: this.compressionConfig?.hotSize ?? 30,
+      maxColdClusters: this.compressionConfig?.maxColdClusters ?? 10,
+      mergeThreshold: this.compressionConfig?.mergeThreshold ?? 0.15,
+    };
   }
 
   async getUserCaching(): Promise<boolean | undefined> {

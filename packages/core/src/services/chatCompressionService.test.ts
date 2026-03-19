@@ -15,6 +15,7 @@ import { CompressionStatus } from '../core/turn.js';
 import type { BaseLlmClient } from '../core/baseLlmClient.js';
 import type { GeminiChat } from '../core/geminiChat.js';
 import type { Config } from '../config/config.js';
+import type { ContextWindow } from './contextWindow.js';
 import * as fileUtils from '../utils/fileUtils.js';
 import { getInitialChatHistory } from '../utils/environmentContext.js';
 
@@ -145,9 +146,19 @@ describe('ChatCompressionService', () => {
       path.join(os.tmpdir(), 'chat-compression-test-'),
     );
     service = new ChatCompressionService();
+    let contextWindow: ContextWindow | undefined;
+    let contextWindowIngestedCount = 0;
     mockChat = {
       getHistory: vi.fn(),
       getLastPromptTokenCount: vi.fn().mockReturnValue(500),
+      getContextWindow: vi.fn(() => contextWindow),
+      setContextWindow: vi.fn((nextWindow: ContextWindow) => {
+        contextWindow = nextWindow;
+      }),
+      getContextWindowIngestedCount: vi.fn(() => contextWindowIngestedCount),
+      setContextWindowIngestedCount: vi.fn((count: number) => {
+        contextWindowIngestedCount = count;
+      }),
     } as unknown as GeminiChat;
 
     const mockGenerateContent = vi
@@ -176,6 +187,12 @@ describe('ChatCompressionService', () => {
         return this;
       },
       getCompressionThreshold: vi.fn(),
+      getCompressionConfig: vi.fn().mockReturnValue({
+        strategy: 'flat',
+        hotSize: 30,
+        maxColdClusters: 10,
+        mergeThreshold: 0.15,
+      }),
       getBaseLlmClient: vi.fn().mockReturnValue({
         generateContent: mockGenerateContent,
       }),
@@ -516,6 +533,265 @@ describe('ChatCompressionService', () => {
       CompressionStatus.COMPRESSION_FAILED_EMPTY_SUMMARY,
     );
     expect(result.newHistory).toBeNull();
+  });
+
+  describe('Union-Find Compression', () => {
+    it('should create a context window for new conversations when configured', async () => {
+      let resolveBackground: (() => void) | undefined;
+      const backgroundClient = {
+        generateContent: vi.fn(
+          () =>
+            new Promise((resolve) => {
+              resolveBackground = () =>
+                resolve({
+                  candidates: [
+                    { content: { parts: [{ text: 'background summary' }] } },
+                  ],
+                } as unknown as GenerateContentResponse);
+            }),
+        ),
+      };
+      vi.mocked(mockConfig.getCompressionConfig).mockReturnValue({
+        strategy: 'union-find',
+        hotSize: 6,
+        maxColdClusters: 3,
+        mergeThreshold: 0.1,
+      });
+      vi.mocked(mockConfig.getBaseLlmClient).mockReturnValue(
+        backgroundClient as unknown as BaseLlmClient,
+      );
+      vi.mocked(mockChat.getHistory).mockReturnValue([
+        { role: 'user', parts: [{ text: 'investigate auth issue' }] },
+        { role: 'model', parts: [{ text: 'checking auth issue' }] },
+        { role: 'user', parts: [{ text: 'auth config uses token A' }] },
+      ]);
+      vi.mocked(mockChat.getLastPromptTokenCount).mockReturnValue(600000);
+
+      const result = await service.compress(
+        mockChat,
+        mockPromptId,
+        true,
+        mockModel,
+        mockConfig,
+        false,
+      );
+
+      expect(result.info.compressionStatus).toBe(CompressionStatus.COMPRESSED);
+      expect(result.newHistory).not.toBeNull();
+      expect(mockChat.setContextWindow).toHaveBeenCalledTimes(1);
+      resolveBackground?.();
+    });
+
+    it('should fall back to flat compression for snapshot-based conversations', async () => {
+      vi.mocked(mockConfig.getCompressionConfig).mockReturnValue({
+        strategy: 'union-find',
+        hotSize: 6,
+        maxColdClusters: 3,
+        mergeThreshold: 0.1,
+      });
+      vi.mocked(mockChat.getHistory).mockReturnValue([
+        {
+          role: 'user',
+          parts: [
+            { text: '<state_snapshot>existing snapshot</state_snapshot>' },
+          ],
+        },
+        { role: 'model', parts: [{ text: 'follow-up' }] },
+        { role: 'user', parts: [{ text: 'latest request' }] },
+      ]);
+      vi.mocked(mockChat.getLastPromptTokenCount).mockReturnValue(600000);
+
+      const result = await service.compress(
+        mockChat,
+        mockPromptId,
+        true,
+        mockModel,
+        mockConfig,
+        false,
+      );
+
+      expect(result.info.compressionStatus).toBe(CompressionStatus.COMPRESSED);
+      expect(
+        mockConfig.getBaseLlmClient().generateContent,
+      ).toHaveBeenCalledTimes(2);
+      expect(mockChat.setContextWindow).not.toHaveBeenCalled();
+    });
+
+    it('should truncate tool output before union-find ingestion', async () => {
+      vi.mocked(mockConfig.getCompressionConfig).mockReturnValue({
+        strategy: 'union-find',
+        hotSize: 4,
+        maxColdClusters: 2,
+        mergeThreshold: 0.1,
+      });
+      vi.mocked(mockChat.getHistory).mockReturnValue([
+        { role: 'user', parts: [{ text: 'topic intro' }] },
+        { role: 'model', parts: [{ text: 'topic ack' }] },
+        { role: 'user', parts: [{ text: 'more topic details' }] },
+        {
+          role: 'user',
+          parts: [
+            {
+              functionResponse: {
+                name: 'shell',
+                response: { output: 'x'.repeat(170000) },
+              },
+            },
+          ],
+        },
+        { role: 'model', parts: [{ text: 'processed huge output' }] },
+      ]);
+      vi.mocked(mockChat.getLastPromptTokenCount).mockReturnValue(600000);
+
+      const result = await service.compress(
+        mockChat,
+        mockPromptId,
+        true,
+        mockModel,
+        mockConfig,
+        false,
+      );
+
+      expect(result.newHistory).not.toBeNull();
+      expect(
+        result.newHistory!.some((content) =>
+          content.parts?.[0].text?.includes('Output too large.'),
+        ),
+      ).toBe(true);
+    });
+
+    it('should fire hooks on every compression attempt', async () => {
+      const firePreCompressEvent = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(mockConfig.getCompressionConfig).mockReturnValue({
+        strategy: 'union-find',
+        hotSize: 4,
+        maxColdClusters: 2,
+        mergeThreshold: 0.1,
+      });
+      mockConfig.getHookSystem = vi.fn().mockReturnValue({
+        firePreCompressEvent,
+      });
+      vi.mocked(mockChat.getLastPromptTokenCount).mockReturnValue(600000);
+
+      vi.mocked(mockChat.getHistory).mockReturnValue([
+        { role: 'user', parts: [{ text: 'auth bug' }] },
+      ]);
+      await service.compress(
+        mockChat,
+        mockPromptId,
+        true,
+        mockModel,
+        mockConfig,
+        false,
+      );
+
+      expect(firePreCompressEvent).toHaveBeenCalledTimes(1);
+
+      vi.mocked(mockChat.getHistory).mockReturnValue([
+        { role: 'user', parts: [{ text: 'auth bug' }] },
+        { role: 'model', parts: [{ text: 'auth bug confirmed' }] },
+        { role: 'user', parts: [{ text: 'auth bug token mismatch' }] },
+        { role: 'model', parts: [{ text: 'auth bug fix pending' }] },
+        { role: 'user', parts: [{ text: 'auth bug root cause' }] },
+      ]);
+
+      await service.compress(
+        mockChat,
+        mockPromptId,
+        true,
+        mockModel,
+        mockConfig,
+        false,
+      );
+
+      expect(firePreCompressEvent).toHaveBeenCalledTimes(2);
+    });
+
+    it('should wrap cold summaries and preserve original hot content', async () => {
+      vi.mocked(mockConfig.getCompressionConfig).mockReturnValue({
+        strategy: 'union-find',
+        hotSize: 4,
+        maxColdClusters: 2,
+        mergeThreshold: 0.1,
+      });
+      vi.mocked(mockChat.getLastPromptTokenCount).mockReturnValue(600000);
+
+      const originalToolTurn: Content = {
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              name: 'shell',
+              response: { output: 'tool output' },
+            },
+          },
+        ],
+      };
+
+      vi.mocked(mockChat.getHistory).mockReturnValue([
+        { role: 'user', parts: [{ text: 'auth bug' }] },
+        { role: 'model', parts: [{ text: 'auth bug confirmed' }] },
+        { role: 'user', parts: [{ text: 'auth bug token mismatch' }] },
+        { role: 'model', parts: [{ text: 'auth bug fix pending' }] },
+        originalToolTurn,
+      ]);
+
+      const result = await service.compress(
+        mockChat,
+        mockPromptId,
+        true,
+        mockModel,
+        mockConfig,
+        false,
+      );
+
+      expect(result.newHistory).not.toBeNull();
+      expect(result.newHistory![0]).toEqual({
+        role: 'user',
+        parts: [
+          {
+            text: expect.stringContaining('<context_summaries>'),
+          },
+        ],
+      });
+      expect(result.newHistory![1]).toEqual({
+        role: 'model',
+        parts: [{ text: 'Got it. Thanks for the additional context!' }],
+      });
+      expect(result.newHistory!.at(-1)).toEqual(originalToolTurn);
+    });
+
+    it('should skip empty content when ingesting into the context window', async () => {
+      vi.mocked(mockConfig.getCompressionConfig).mockReturnValue({
+        strategy: 'union-find',
+        hotSize: 4,
+        maxColdClusters: 2,
+        mergeThreshold: 0.1,
+      });
+      vi.mocked(mockChat.getLastPromptTokenCount).mockReturnValue(600000);
+      vi.mocked(mockChat.getHistory).mockReturnValue([
+        { role: 'user', parts: [] },
+        { role: 'model', parts: [{ text: 'actual context' }] },
+        { role: 'user', parts: [{ text: 'latest request' }] },
+      ]);
+
+      const result = await service.compress(
+        mockChat,
+        mockPromptId,
+        true,
+        mockModel,
+        mockConfig,
+        false,
+      );
+
+      expect(result.info.compressionStatus).toBe(CompressionStatus.COMPRESSED);
+      expect(result.newHistory).not.toBeNull();
+      expect(
+        result.newHistory?.some((content) =>
+          content.parts?.some((part) => part.text?.includes('user:')),
+        ),
+      ).toBe(false);
+    });
   });
 
   describe('Reverse Token Budget Truncation', () => {

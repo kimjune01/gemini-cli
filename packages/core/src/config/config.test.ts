@@ -463,6 +463,38 @@ describe('Server Config (config.ts)', () => {
       });
     });
 
+    describe('getCompressionConfig', () => {
+      it('should return flat defaults when unset', () => {
+        const config = new Config(baseParams);
+
+        expect(config.getCompressionConfig()).toEqual({
+          strategy: 'flat',
+          hotSize: 30,
+          maxColdClusters: 10,
+          mergeThreshold: 0.15,
+        });
+      });
+
+      it('should return configured union-find settings', () => {
+        const config = new Config({
+          ...baseParams,
+          compressionConfig: {
+            strategy: 'union-find',
+            hotSize: 24,
+            maxColdClusters: 8,
+            mergeThreshold: 0.22,
+          },
+        });
+
+        expect(config.getCompressionConfig()).toEqual({
+          strategy: 'union-find',
+          hotSize: 24,
+          maxColdClusters: 8,
+          mergeThreshold: 0.22,
+        });
+      });
+    });
+
     describe('getUserCaching', () => {
       it('should return the remote experiment flag when available', async () => {
         const config = new Config({

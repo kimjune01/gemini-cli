@@ -10,7 +10,7 @@ import type { GeminiChat } from '../core/geminiChat.js';
 import { type ChatCompressionInfo, CompressionStatus } from '../core/turn.js';
 import { tokenLimit } from '../core/tokenLimits.js';
 import { getCompressionPrompt } from '../core/prompts.js';
-import { getResponseText } from '../utils/partUtils.js';
+import { getResponseText , partToString } from '../utils/partUtils.js';
 import { logChatCompression } from '../telemetry/loggers.js';
 import { makeChatCompressionEvent, LlmRole } from '../telemetry/types.js';
 import {
@@ -32,6 +32,9 @@ import {
   PREVIEW_GEMINI_3_1_MODEL,
 } from '../config/models.js';
 import { PreCompressTrigger } from '../hooks/types.js';
+import { ContextWindow } from './contextWindow.js';
+import { TFIDFEmbedder } from './embeddingService.js';
+import { ClusterSummarizer } from './clusterSummarizer.js';
 
 /**
  * Default threshold for compression token count as a fraction of the model's
@@ -135,6 +138,7 @@ async function truncateHistoryToBudget(
 ): Promise<Content[]> {
   let functionResponseTokenCounter = 0;
   const truncatedHistory: Content[] = [];
+  const truncateThreshold = config.getTruncateToolOutputThreshold();
 
   // Iterate backwards: newest messages first to prioritize their context.
   for (let i = history.length - 1; i >= 0; i--) {
@@ -156,13 +160,13 @@ async function truncateHistoryToBudget(
           } else if (responseObj && typeof responseObj === 'object') {
             if (
               'output' in responseObj &&
-              // eslint-disable-next-line no-restricted-syntax
+               
               typeof responseObj['output'] === 'string'
             ) {
               contentStr = responseObj['output'];
             } else if (
               'content' in responseObj &&
-              // eslint-disable-next-line no-restricted-syntax
+               
               typeof responseObj['content'] === 'string'
             ) {
               contentStr = responseObj['content'];
@@ -176,8 +180,9 @@ async function truncateHistoryToBudget(
           const tokens = estimateTokenCountSync([{ text: contentStr }]);
 
           if (
+            contentStr.length > truncateThreshold ||
             functionResponseTokenCounter + tokens >
-            COMPRESSION_FUNCTION_RESPONSE_TOKEN_BUDGET
+              COMPRESSION_FUNCTION_RESPONSE_TOKEN_BUDGET
           ) {
             try {
               // Budget exceeded: Truncate this response.
@@ -191,7 +196,7 @@ async function truncateHistoryToBudget(
               const truncatedMessage = formatTruncatedToolOutput(
                 contentStr,
                 outputFile,
-                config.getTruncateToolOutputThreshold(),
+                truncateThreshold,
               );
 
               newParts.unshift({
@@ -230,6 +235,69 @@ async function truncateHistoryToBudget(
   return truncatedHistory;
 }
 
+function functionResponseToContextString(response: unknown): string {
+  if (typeof response === 'string') {
+    return response;
+  }
+
+  if (response && typeof response === 'object') {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- response shape is checked at runtime
+    const responseRecord = response as Record<string, unknown>;
+    const preferredField = ['output', 'content'].find(
+      (key) => typeof responseRecord[key] === 'string',
+    );
+
+    if (preferredField) {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- guarded by typeof check above
+      const preferredValue = responseRecord[preferredField] as string;
+      const remainingEntries = Object.entries(responseRecord).filter(
+        ([key]) => key !== preferredField,
+      );
+
+      if (remainingEntries.length === 0) {
+        return preferredValue;
+      }
+
+      return `${preferredValue}\n${JSON.stringify(
+        Object.fromEntries(remainingEntries),
+      )}`;
+    }
+
+    return JSON.stringify(responseRecord);
+  }
+
+  return JSON.stringify(response ?? null);
+}
+
+function contentToContextString(content: Content): string {
+  const parts = (content.parts ?? [])
+    .map((part) => {
+      if (part.text) {
+        return part.text;
+      }
+      if (part.functionCall) {
+        return `[Function Call: ${part.functionCall.name}] ${JSON.stringify(part.functionCall.args ?? {})}`;
+      }
+      if (part.functionResponse) {
+        return `[Function Response: ${part.functionResponse.name}] ${functionResponseToContextString(part.functionResponse.response ?? {})}`;
+      }
+      return partToString(part, { verbose: true });
+    })
+    .filter(Boolean)
+    .join('\n');
+
+  if (!parts) {
+    return '';
+  }
+
+  return `${content.role ?? 'user'}:\n${parts}`.trim();
+}
+
+function getContentTimestamp(content: Content): string | undefined {
+  const candidate = (content as Content & { timestamp?: unknown }).timestamp;
+  return typeof candidate === 'string' ? candidate : undefined;
+}
+
 export class ChatCompressionService {
   async compress(
     chat: GeminiChat,
@@ -241,7 +309,49 @@ export class ChatCompressionService {
     abortSignal?: AbortSignal,
   ): Promise<{ newHistory: Content[] | null; info: ChatCompressionInfo }> {
     const curatedHistory = chat.getHistory(true);
+    if (curatedHistory.length > 0) {
+      const trigger = force
+        ? PreCompressTrigger.Manual
+        : PreCompressTrigger.Auto;
+      await config.getHookSystem()?.firePreCompressEvent(trigger);
+    }
 
+    const strategy = config.getCompressionConfig().strategy;
+    if (strategy === 'union-find') {
+      return this.compactWithUnionFind(
+        chat,
+        curatedHistory,
+        promptId,
+        force,
+        model,
+        config,
+        hasFailedCompressionAttempt,
+        abortSignal,
+      );
+    }
+
+    return this.compressWithFlat(
+      chat,
+      curatedHistory,
+      promptId,
+      force,
+      model,
+      config,
+      hasFailedCompressionAttempt,
+      abortSignal,
+    );
+  }
+
+  private async compressWithFlat(
+    chat: GeminiChat,
+    curatedHistory: readonly Content[],
+    promptId: string,
+    force: boolean,
+    model: string,
+    config: Config,
+    hasFailedCompressionAttempt: boolean,
+    abortSignal?: AbortSignal,
+  ): Promise<{ newHistory: Content[] | null; info: ChatCompressionInfo }> {
     // Regardless of `force`, don't do anything if the history is empty.
     if (curatedHistory.length === 0) {
       return {
@@ -253,11 +363,6 @@ export class ChatCompressionService {
         },
       };
     }
-
-    // Fire PreCompress hook before compression
-    // This fires for both manual and auto compression attempts
-    const trigger = force ? PreCompressTrigger.Manual : PreCompressTrigger.Auto;
-    await config.getHookSystem()?.firePreCompressEvent(trigger);
 
     const originalTokenCount = chat.getLastPromptTokenCount();
 
@@ -471,5 +576,201 @@ export class ChatCompressionService {
         },
       };
     }
+  }
+
+  async compactWithUnionFind(
+    chat: GeminiChat,
+    curatedHistory: readonly Content[],
+    _promptId: string,
+    force: boolean,
+    model: string,
+    config: Config,
+    _hasFailedCompressionAttempt: boolean,
+    _abortSignal?: AbortSignal,
+  ): Promise<{ newHistory: Content[] | null; info: ChatCompressionInfo }> {
+    if (curatedHistory.length === 0) {
+      return {
+        newHistory: null,
+        info: {
+          originalTokenCount: 0,
+          newTokenCount: 0,
+          compressionStatus: CompressionStatus.NOOP,
+        },
+      };
+    }
+
+    const originalTokenCount = chat.getLastPromptTokenCount();
+    if (!force) {
+      const threshold =
+        (await config.getCompressionThreshold()) ??
+        DEFAULT_COMPRESSION_TOKEN_THRESHOLD;
+      if (originalTokenCount < threshold * tokenLimit(model)) {
+        return {
+          newHistory: null,
+          info: {
+            originalTokenCount,
+            newTokenCount: originalTokenCount,
+            compressionStatus: CompressionStatus.NOOP,
+          },
+        };
+      }
+    }
+
+    const truncatedHistory = await truncateHistoryToBudget(
+      curatedHistory,
+      config,
+    );
+    if (_hasFailedCompressionAttempt && !force) {
+      const truncatedTokenCount = estimateTokenCountSync(
+        truncatedHistory.flatMap((content) => content.parts || []),
+      );
+      if (truncatedTokenCount < originalTokenCount) {
+        return {
+          newHistory: truncatedHistory,
+          info: {
+            originalTokenCount,
+            newTokenCount: truncatedTokenCount,
+            compressionStatus: CompressionStatus.CONTENT_TRUNCATED,
+          },
+        };
+      }
+
+      return {
+        newHistory: null,
+        info: {
+          originalTokenCount,
+          newTokenCount: originalTokenCount,
+          compressionStatus: CompressionStatus.NOOP,
+        },
+      };
+    }
+
+    if (
+      !chat.getContextWindow() &&
+      curatedHistory.some((content) =>
+        content.parts?.some((part) => part.text?.includes('<state_snapshot>')),
+      )
+    ) {
+      return this.compressWithFlat(
+        chat,
+        curatedHistory,
+        _promptId,
+        force,
+        model,
+        config,
+        _hasFailedCompressionAttempt,
+        _abortSignal,
+      );
+    }
+    const compressionConfig = config.getCompressionConfig();
+    let window = chat.getContextWindow();
+    if (!window) {
+      window = new ContextWindow(
+        new TFIDFEmbedder(),
+        new ClusterSummarizer(
+          config.getBaseLlmClient(),
+          modelStringToModelConfigAlias(model),
+        ),
+        {
+          graduateAt: Math.max(1, compressionConfig.hotSize - 4),
+          evictAt: compressionConfig.hotSize,
+          maxColdClusters: compressionConfig.maxColdClusters,
+          mergeThreshold: compressionConfig.mergeThreshold,
+        },
+      );
+      chat.setContextWindow(window);
+      chat.setContextWindowIngestedCount(0);
+    }
+
+    const ingestedCount = Math.min(
+      chat.getContextWindowIngestedCount(),
+      truncatedHistory.length,
+    );
+    for (const content of truncatedHistory.slice(ingestedCount)) {
+      const contextText = contentToContextString(content);
+      if (!contextText) {
+        continue;
+      }
+      window.append(contextText, getContentTimestamp(content));
+    }
+    chat.setContextWindowIngestedCount(truncatedHistory.length);
+
+    window.drainMergeCount();
+
+    const lastUserMessage = [...truncatedHistory]
+      .reverse()
+      .find((content) => content.role === 'user' && content.parts?.length);
+    const rendered = window.render(
+      lastUserMessage ? contentToContextString(lastUserMessage) || null : null,
+      3,
+      0.05,
+    );
+
+    void window.resolveDirty().catch((error) => {
+      debugLogger.debug('Union-find background summarization failed:', error);
+    });
+
+    const hotStart = Math.max(0, rendered.length - window.hotCount);
+    const coldMessages = rendered.slice(0, hotStart);
+    const hotHistory = truncatedHistory.slice(
+      Math.max(0, truncatedHistory.length - window.hotCount),
+    );
+    const newHistory: Content[] = [];
+
+    if (coldMessages.length > 0) {
+      newHistory.push({
+        role: 'user',
+        parts: [
+          {
+            text:
+              '<context_summaries>\n' +
+              coldMessages.join('\n---\n') +
+              '\n</context_summaries>',
+          },
+        ],
+      });
+      newHistory.push({
+        role: 'model',
+        parts: [{ text: 'Got it. Thanks for the additional context!' }],
+      });
+    }
+
+    newHistory.push(...hotHistory);
+
+    const fullNewHistory = await getInitialChatHistory(config, newHistory);
+    const newTokenCount = await calculateRequestTokenCount(
+      fullNewHistory.flatMap((content) => content.parts || []),
+      config.getContentGenerator(),
+      model,
+    );
+
+    if (newTokenCount > originalTokenCount) {
+      return {
+        newHistory: null,
+        info: {
+          originalTokenCount,
+          newTokenCount,
+          compressionStatus:
+            CompressionStatus.COMPRESSION_FAILED_INFLATED_TOKEN_COUNT,
+        },
+      };
+    }
+
+    logChatCompression(
+      config,
+      makeChatCompressionEvent({
+        tokens_before: originalTokenCount,
+        tokens_after: newTokenCount,
+      }),
+    );
+
+    return {
+      newHistory,
+      info: {
+        originalTokenCount,
+        newTokenCount,
+        compressionStatus: CompressionStatus.COMPRESSED,
+      },
+    };
   }
 }

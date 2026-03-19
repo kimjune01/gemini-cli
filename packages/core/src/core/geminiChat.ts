@@ -59,6 +59,7 @@ import {
 } from '../availability/policyHelpers.js';
 import { coreEvents } from '../utils/events.js';
 import type { AgentLoopContext } from '../config/agent-loop-context.js';
+import type { ContextWindow } from '../services/contextWindow.js';
 
 export enum StreamEventType {
   /** A regular content chunk from the API. */
@@ -252,6 +253,8 @@ export class GeminiChat {
   private sendPromise: Promise<void> = Promise.resolve();
   private readonly chatRecordingService: ChatRecordingService;
   private lastPromptTokenCount: number;
+  private contextWindow?: ContextWindow;
+  private contextWindowIngestedCount = 0;
 
   constructor(
     private readonly context: AgentLoopContext,
@@ -737,6 +740,8 @@ export class GeminiChat {
    */
   clearHistory(): void {
     this.history = [];
+    this.contextWindow = undefined;
+    this.contextWindowIngestedCount = 0;
   }
 
   /**
@@ -748,6 +753,8 @@ export class GeminiChat {
 
   setHistory(history: readonly Content[]): void {
     this.history = [...history];
+    this.contextWindow = undefined;
+    this.contextWindowIngestedCount = 0;
     this.lastPromptTokenCount = estimateTokenCountSync(
       this.history.flatMap((c) => c.parts || []),
     );
@@ -998,6 +1005,22 @@ export class GeminiChat {
 
   getLastPromptTokenCount(): number {
     return this.lastPromptTokenCount;
+  }
+
+  getContextWindow(): ContextWindow | undefined {
+    return this.contextWindow;
+  }
+
+  setContextWindow(contextWindow: ContextWindow): void {
+    this.contextWindow = contextWindow;
+  }
+
+  getContextWindowIngestedCount(): number {
+    return this.contextWindowIngestedCount;
+  }
+
+  setContextWindowIngestedCount(count: number): void {
+    this.contextWindowIngestedCount = count;
   }
 
   /**
