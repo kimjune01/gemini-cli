@@ -15,7 +15,7 @@ import { CompressionStatus } from '../core/turn.js';
 import type { BaseLlmClient } from '../core/baseLlmClient.js';
 import type { GeminiChat } from '../core/geminiChat.js';
 import type { Config } from '../config/config.js';
-import type { ContextWindow } from './contextWindow.js';
+import { ContextWindow } from './contextWindow.js';
 import * as fileUtils from '../utils/fileUtils.js';
 import { getInitialChatHistory } from '../utils/environmentContext.js';
 
@@ -580,6 +580,35 @@ describe('ChatCompressionService', () => {
       expect(result.newHistory).not.toBeNull();
       expect(mockChat.setContextWindow).toHaveBeenCalledTimes(1);
       resolveBackground?.();
+    });
+
+    it('should pass the compression abort signal into background dirty resolution', async () => {
+      const resolveDirtySpy = vi.spyOn(ContextWindow.prototype, 'resolveDirty');
+      const abortSignal = new AbortController().signal;
+      vi.mocked(mockConfig.getCompressionConfig).mockReturnValue({
+        strategy: 'union-find',
+        hotSize: 6,
+        maxColdClusters: 3,
+        mergeThreshold: 0.1,
+      });
+      vi.mocked(mockChat.getHistory).mockReturnValue([
+        { role: 'user', parts: [{ text: 'investigate auth issue' }] },
+        { role: 'model', parts: [{ text: 'checking auth issue' }] },
+        { role: 'user', parts: [{ text: 'auth config uses token A' }] },
+      ]);
+      vi.mocked(mockChat.getLastPromptTokenCount).mockReturnValue(600000);
+
+      await service.compress(
+        mockChat,
+        mockPromptId,
+        true,
+        mockModel,
+        mockConfig,
+        false,
+        abortSignal,
+      );
+
+      expect(resolveDirtySpy).toHaveBeenCalledWith(abortSignal);
     });
 
     it('should fall back to flat compression for snapshot-based conversations', async () => {

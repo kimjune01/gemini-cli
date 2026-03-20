@@ -218,10 +218,21 @@ describe('Forest', () => {
 
     await forest.resolveDirty();
 
-    expect(summarizer.summarize).toHaveBeenCalledWith([
-      '[2026-03-19T00:00:00.000Z] a',
-      '[2026-03-19T00:01:00.000Z] b',
-    ]);
+    expect(summarizer.summarize).toHaveBeenCalledWith(
+      ['[2026-03-19T00:00:00.000Z] a', '[2026-03-19T00:01:00.000Z] b'],
+      undefined,
+    );
+  });
+
+  it('passes abort signals through forest dirty resolution', async () => {
+    const abortSignal = new AbortController().signal;
+    forest.insert(1, 'a', [1, 0]);
+    forest.insert(2, 'b', [1, 0]);
+    forest.union(1, 2);
+
+    await forest.resolveDirty(abortSignal);
+
+    expect(summarizer.summarize).toHaveBeenCalledWith(['a', 'b'], abortSignal);
   });
 
   it('carries forward resolved summaries plus new raw content on later merges', async () => {
@@ -388,6 +399,33 @@ describe('ContextWindow', () => {
 
     expect(window.forest.dirtyRoots()).toEqual([]);
     expect(summarizer.summarize).toHaveBeenCalled();
+  });
+
+  it('passes abort signals through context window dirty resolution', async () => {
+    const summarizer = {
+      summarize: vi.fn(async (messages: string[]) => messages.join(' | ')),
+    };
+    const window = new ContextWindow(
+      new StubEmbedder({ a: [1, 0], b: [1, 0], c: [1, 0] }),
+      summarizer,
+      {
+        graduateAt: 1,
+        evictAt: 3,
+        maxColdClusters: 2,
+        mergeThreshold: 0.1,
+      },
+    );
+    const abortSignal = new AbortController().signal;
+
+    window.append('a');
+    window.append('b');
+    window.append('c');
+    await window.resolveDirty(abortSignal);
+
+    expect(summarizer.summarize).toHaveBeenCalledWith(
+      expect.arrayContaining(['a', 'b']),
+      abortSignal,
+    );
   });
 
   it('enforces the cold-cluster cap by merging closest roots', () => {

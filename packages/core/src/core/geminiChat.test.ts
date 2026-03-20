@@ -33,6 +33,7 @@ import * as policyHelpers from '../availability/policyHelpers.js';
 import { makeResolvedModelConfig } from '../services/modelConfigServiceTestUtils.js';
 import type { HookSystem } from '../hooks/hookSystem.js';
 import { LlmRole } from '../telemetry/types.js';
+import { ContextWindow } from '../services/contextWindow.js';
 
 // Mock fs module to prevent actual file system operations during tests
 const mockFileSystem = new Map<string, string>();
@@ -262,6 +263,35 @@ describe('GeminiChat', () => {
       expect(chatWithHistory.getLastPromptTokenCount()).toBeGreaterThan(
         initialCount,
       );
+    });
+
+    it('preserves the existing context window across history replacement', () => {
+      const contextWindow = new ContextWindow(
+        { embed: () => [0] },
+        { summarize: vi.fn(async () => '') },
+      );
+      chat.setContextWindow(contextWindow);
+      chat.setContextWindowIngestedCount(7);
+
+      chat.setHistory([{ role: 'user', parts: [{ text: 'compressed turn' }] }]);
+
+      expect(chat.getContextWindow()).toBe(contextWindow);
+      expect(chat.getContextWindowIngestedCount()).toBe(7);
+    });
+
+    it('still clears the context window on explicit history reset', () => {
+      chat.setContextWindow(
+        new ContextWindow(
+          { embed: () => [0] },
+          { summarize: vi.fn(async () => '') },
+        ),
+      );
+      chat.setContextWindowIngestedCount(3);
+
+      chat.clearHistory();
+
+      expect(chat.getContextWindow()).toBeUndefined();
+      expect(chat.getContextWindowIngestedCount()).toBe(0);
     });
   });
 

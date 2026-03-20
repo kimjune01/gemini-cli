@@ -10,7 +10,7 @@ import type { GeminiChat } from '../core/geminiChat.js';
 import { type ChatCompressionInfo, CompressionStatus } from '../core/turn.js';
 import { tokenLimit } from '../core/tokenLimits.js';
 import { getCompressionPrompt } from '../core/prompts.js';
-import { getResponseText , partToString } from '../utils/partUtils.js';
+import { getResponseText, partToString } from '../utils/partUtils.js';
 import { logChatCompression } from '../telemetry/loggers.js';
 import { makeChatCompressionEvent, LlmRole } from '../telemetry/types.js';
 import {
@@ -160,13 +160,11 @@ async function truncateHistoryToBudget(
           } else if (responseObj && typeof responseObj === 'object') {
             if (
               'output' in responseObj &&
-               
               typeof responseObj['output'] === 'string'
             ) {
               contentStr = responseObj['output'];
             } else if (
               'content' in responseObj &&
-               
               typeof responseObj['content'] === 'string'
             ) {
               contentStr = responseObj['content'];
@@ -586,7 +584,7 @@ export class ChatCompressionService {
     model: string,
     config: Config,
     _hasFailedCompressionAttempt: boolean,
-    _abortSignal?: AbortSignal,
+    abortSignal?: AbortSignal,
   ): Promise<{ newHistory: Content[] | null; info: ChatCompressionInfo }> {
     if (curatedHistory.length === 0) {
       return {
@@ -659,7 +657,7 @@ export class ChatCompressionService {
         model,
         config,
         _hasFailedCompressionAttempt,
-        _abortSignal,
+        abortSignal,
       );
     }
     const compressionConfig = config.getCompressionConfig();
@@ -706,7 +704,7 @@ export class ChatCompressionService {
       0.05,
     );
 
-    void window.resolveDirty().catch((error) => {
+    void window.resolveDirty(abortSignal).catch((error) => {
       debugLogger.debug('Union-find background summarization failed:', error);
     });
 

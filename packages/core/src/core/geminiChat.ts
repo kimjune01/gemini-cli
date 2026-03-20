@@ -753,8 +753,6 @@ export class GeminiChat {
 
   setHistory(history: readonly Content[]): void {
     this.history = [...history];
-    this.contextWindow = undefined;
-    this.contextWindowIngestedCount = 0;
     this.lastPromptTokenCount = estimateTokenCountSync(
       this.history.flatMap((c) => c.parts || []),
     );

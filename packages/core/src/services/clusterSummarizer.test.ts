@@ -62,6 +62,24 @@ describe('ClusterSummarizer', () => {
     expect(request.contents[0].parts?.[0].text).toContain('[2] msg 2');
   });
 
+  it('passes the caller abort signal through to the model request', async () => {
+    const llmClient = {
+      generateContent: vi.fn().mockResolvedValue({
+        candidates: [{ content: { parts: [{ text: 'cluster summary' }] } }],
+      } as unknown as GenerateContentResponse),
+    } as unknown as BaseLlmClient;
+    const abortSignal = new AbortController().signal;
+
+    const summarizer = new ClusterSummarizer(
+      llmClient,
+      'chat-compression-3-pro',
+    );
+    await summarizer.summarize(['msg 1', 'msg 2'], abortSignal);
+
+    const request = vi.mocked(llmClient.generateContent).mock.calls[0][0];
+    expect(request.abortSignal).toBe(abortSignal);
+  });
+
   it('falls back to joined messages when the model returns no text', async () => {
     const llmClient = {
       generateContent: vi.fn().mockResolvedValue({

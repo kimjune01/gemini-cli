@@ -7,7 +7,7 @@
 import type { Embedder } from './embeddingService.js';
 
 export interface Summarizer {
-  summarize(messages: string[]): Promise<string>;
+  summarize(messages: string[], abortSignal?: AbortSignal): Promise<string>;
 }
 
 export class Message {
@@ -149,14 +149,14 @@ export class Forest {
     return rootA;
   }
 
-  async resolveDirty(): Promise<void> {
+  async resolveDirty(abortSignal?: AbortSignal): Promise<void> {
     let ranOwnBatch = false;
 
     while (true) {
       if (this._resolvePromise) {
         await this._resolvePromise;
       } else {
-        this._resolvePromise = this._resolveDirtyBatch();
+        this._resolvePromise = this._resolveDirtyBatch(abortSignal);
         ranOwnBatch = true;
         try {
           await this._resolvePromise;
@@ -171,7 +171,7 @@ export class Forest {
     }
   }
 
-  private async _resolveDirtyBatch(): Promise<void> {
+  private async _resolveDirtyBatch(abortSignal?: AbortSignal): Promise<void> {
     for (const [root, inputs] of [...this._dirtyInputs.entries()]) {
       try {
         if (this.find(root) !== root) {
@@ -182,7 +182,9 @@ export class Forest {
       }
 
       try {
-        const summary = (await this._summarizer.summarize(inputs)).trim();
+        const summary = (
+          await this._summarizer.summarize(inputs, abortSignal)
+        ).trim();
         if (this.find(root) !== root) {
           continue;
         }
@@ -377,8 +379,8 @@ export class ContextWindow {
     return [...cold, ...hot];
   }
 
-  async resolveDirty(): Promise<void> {
-    await this._forest.resolveDirty();
+  async resolveDirty(abortSignal?: AbortSignal): Promise<void> {
+    await this._forest.resolveDirty(abortSignal);
   }
 
   expand(rootId: number): string[] {

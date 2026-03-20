@@ -15,7 +15,10 @@ export class ClusterSummarizer implements Summarizer {
     private readonly modelConfigKey: string,
   ) {}
 
-  async summarize(messages: string[]): Promise<string> {
+  async summarize(
+    messages: string[],
+    abortSignal?: AbortSignal,
+  ): Promise<string> {
     if (messages.length === 0) {
       return '';
     }
@@ -36,7 +39,7 @@ export class ClusterSummarizer implements Summarizer {
         ],
         promptId: 'cluster-summarize',
         role: LlmRole.UTILITY_COMPRESSOR,
-        abortSignal: new AbortController().signal,
+        abortSignal,
       });
 
       return getResponseText(response)?.trim() || fallback;
