@@ -33,9 +33,9 @@ import {
   PREVIEW_GEMINI_3_1_FLASH_LITE_MODEL,
 } from '../config/models.js';
 import { PreCompressTrigger } from '../hooks/types.js';
-import { ContextWindow } from './contextWindow.js';
-import { TFIDFEmbedder } from './embeddingService.js';
-import { ClusterSummarizer } from './clusterSummarizer.js';
+import { ContextWindow } from '../services/contextWindow.js';
+import { TFIDFEmbedder } from '../services/embeddingService.js';
+import { ClusterSummarizer } from '../services/clusterSummarizer.js';
 
 /**
  * Default threshold for compression token count as a fraction of the model's
@@ -162,12 +162,12 @@ async function truncateHistoryToBudget(
           } else if (responseObj && typeof responseObj === 'object') {
             if (
               'output' in responseObj &&
-              typeof responseObj['output'] === 'string'
+              typeof responseObj['output'] === 'string' // eslint-disable-line no-restricted-syntax
             ) {
               contentStr = responseObj['output'];
             } else if (
               'content' in responseObj &&
-              typeof responseObj['content'] === 'string'
+              typeof responseObj['content'] === 'string' // eslint-disable-line no-restricted-syntax
             ) {
               contentStr = responseObj['content'];
             } else {

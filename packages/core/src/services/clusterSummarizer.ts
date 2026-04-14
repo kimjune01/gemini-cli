@@ -9,6 +9,15 @@ import { getResponseText } from '../utils/partUtils.js';
 import { LlmRole } from '../telemetry/types.js';
 import type { Summarizer } from './contextWindow.js';
 
+function sanitizePromptInput(value: string): string {
+  return value
+    .replace(/\\[rn]/g, ' ')
+    .replace(/[\r\n\u2028\u2029]+/g, ' ')
+    .replace(/```/g, "'''")
+    .replace(/[<>]/g, (char) => (char === '<' ? '&lt;' : '&gt;'))
+    .replace(/[\x00-\x1f\x7f]/g, ''); // eslint-disable-line no-control-regex
+}
+
 /**
  * Cluster summarizer using BaseLlmClient for LLM-generated summaries.
  *
@@ -34,7 +43,7 @@ export class ClusterSummarizer implements Summarizer {
             role: 'user',
             parts: [
               {
-                text: `Summarize the following conversation messages into a concise, information-dense paragraph. Preserve all specific technical details, file paths, tool results, variable names, and user constraints.\n\nMessages:\n${messages.map((m, i) => `[${i + 1}] ${m}`).join('\n\n')}`,
+                text: `Summarize the following conversation messages into a concise, information-dense paragraph. Preserve all specific technical details, file paths, tool results, variable names, and user constraints.\n\nMessages:\n${messages.map((m, i) => `[${i + 1}] ${sanitizePromptInput(m)}`).join('\n')}`,
               },
             ],
           },
