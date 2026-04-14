@@ -263,7 +263,7 @@ export class ChatCompressionService {
     hasFailedCompressionAttempt: boolean,
     abortSignal?: AbortSignal,
   ): Promise<{ newHistory: Content[] | null; info: ChatCompressionInfo }> {
-    const strategy = config.getCompressionStrategy();
+    const strategy = await config.getCompressionStrategy();
 
     if (strategy === 'union-find') {
       return this.compactWithUnionFind(
@@ -537,7 +537,7 @@ export class ChatCompressionService {
     model: string,
     config: Config,
     hasFailedCompressionAttempt: boolean,
-    _abortSignal?: AbortSignal,
+    abortSignal?: AbortSignal,
   ): Promise<{ newHistory: Content[] | null; info: ChatCompressionInfo }> {
     const curatedHistory = chat.getHistory(true);
 
@@ -609,6 +609,7 @@ export class ChatCompressionService {
     const summarizer = new ClusterSummarizer(
       config.getBaseLlmClient(),
       modelStringToModelConfigAlias(model),
+      abortSignal,
     );
     const contextWindow = new ContextWindow(embedder, summarizer, {
       graduateAt: UNION_FIND_GRADUATE_AT,
@@ -623,8 +624,16 @@ export class ChatCompressionService {
         ?.map((p) => {
           if (p.text) return p.text;
           if (p.functionCall) return `[Tool call: ${p.functionCall.name}]`;
-          if (p.functionResponse)
-            return `[Tool response: ${p.functionResponse.name}]`;
+          if (p.functionResponse) {
+            const responseStr = JSON.stringify(
+              p.functionResponse.response ?? '',
+            );
+            const preview =
+              responseStr.length > 500
+                ? responseStr.slice(0, 500) + '...'
+                : responseStr;
+            return `[Tool response: ${p.functionResponse.name}] ${preview}`;
+          }
           return '';
         })
         .join(' ')
@@ -634,17 +643,14 @@ export class ChatCompressionService {
       }
     }
 
-    // Render the compacted context (synchronous — uses cached summaries)
+    // Resolve dirty clusters before rendering so summaries are available
+    await contextWindow.resolveDirty();
+
     const rendered = contextWindow.render(
       null,
       UNION_FIND_RETRIEVE_K,
       UNION_FIND_RETRIEVE_MIN_SIM,
     );
-
-    // Fire-and-forget: resolve dirty clusters in background
-    // In production, this runs during the main LLM call wait.
-    // Here we await it since there's no concurrent main call.
-    await contextWindow.resolveDirty();
 
     // Build new history: cold summaries as a single user message, then hot messages
     const coldSummaries = rendered.slice(

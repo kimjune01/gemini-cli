@@ -26,10 +26,16 @@ function sanitizePromptInput(value: string): string {
 export class ClusterSummarizer implements Summarizer {
   private _client: BaseLlmClient;
   private _modelConfigKey: string;
+  private _abortSignal?: AbortSignal;
 
-  constructor(client: BaseLlmClient, modelConfigKey: string) {
+  constructor(
+    client: BaseLlmClient,
+    modelConfigKey: string,
+    abortSignal?: AbortSignal,
+  ) {
     this._client = client;
     this._modelConfigKey = modelConfigKey;
+    this._abortSignal = abortSignal;
   }
 
   async summarize(messages: string[]): Promise<string> {
@@ -50,13 +56,14 @@ export class ClusterSummarizer implements Summarizer {
         ],
         promptId: 'cluster-summarize',
         role: LlmRole.UTILITY_COMPRESSOR,
-        abortSignal: new AbortController().signal,
+        abortSignal: this._abortSignal ?? new AbortController().signal,
       });
 
       const text = getResponseText(response)?.trim();
       if (!text) return fallback;
       return text;
-    } catch {
+    } catch (e) {
+      if (this._abortSignal?.aborted) throw e;
       return fallback;
     }
   }
