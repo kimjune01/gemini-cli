@@ -189,6 +189,7 @@ public class GeminiSandbox {
     private const uint DISABLE_MAX_PRIVILEGE = 0x1;
     private const int SE_FILE_OBJECT = 1;
     private const uint LABEL_SECURITY_INFORMATION = 0x00000010;
+    private const string LowIntegritySid = "S-1-16-4096";
 
     static int Main(string[] args) {
         if (args.Length < 3) {
@@ -251,9 +252,8 @@ public class GeminiSandbox {
             }
 
             // 2. Lower Integrity Level to Low
-            // S-1-16-4096 is the SID for "Low Mandatory Level"
             IntPtr lowIntegritySid = IntPtr.Zero;
-            if (ConvertStringSidToSid("S-1-16-4096", out lowIntegritySid)) {
+            if (ConvertStringSidToSid(LowIntegritySid, out lowIntegritySid)) {
                 TOKEN_MANDATORY_LABEL tml = new TOKEN_MANDATORY_LABEL();
                 tml.Label.Sid = lowIntegritySid;
                 tml.Label.Attributes = SE_GROUP_INTEGRITY;
@@ -431,19 +431,11 @@ public class GeminiSandbox {
     }
 
     private static void ApplyBulkAcls(HashSet<string> allowedPaths, HashSet<string> forbiddenPaths) {
-        SecurityIdentifier lowSid = new SecurityIdentifier("S-1-16-4096");
+        SecurityIdentifier lowSid = new SecurityIdentifier(LowIntegritySid);
 
         foreach (string path in forbiddenPaths) {
             try {
-                if (File.Exists(path)) {
-                    FileSecurity fs = File.GetAccessControl(path);
-                    fs.AddAccessRule(new FileSystemAccessRule(lowSid, FileSystemRights.FullControl, AccessControlType.Deny));
-                    File.SetAccessControl(path, fs);
-                } else if (Directory.Exists(path)) {
-                    DirectorySecurity ds = Directory.GetAccessControl(path);
-                    ds.AddAccessRule(new FileSystemAccessRule(lowSid, FileSystemRights.FullControl, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Deny));
-                    Directory.SetAccessControl(path, ds);
-                }
+                ApplyDenyAcl(path, lowSid);
             } catch (Exception e) {
                 Console.Error.WriteLine("Warning: Failed to apply deny ACL to " + path + ": " + e.Message);
             }
@@ -451,37 +443,57 @@ public class GeminiSandbox {
 
         foreach (string path in allowedPaths) {
             try {
-                bool isDir = Directory.Exists(path);
-                if (isDir) {
-                    DirectorySecurity ds = Directory.GetAccessControl(path);
-                    ds.AddAccessRule(new FileSystemAccessRule(lowSid, FileSystemRights.Modify, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
-                    Directory.SetAccessControl(path, ds);
-                } else if (File.Exists(path)) {
-                    FileSecurity fs = File.GetAccessControl(path);
-                    fs.AddAccessRule(new FileSystemAccessRule(lowSid, FileSystemRights.Modify, AccessControlType.Allow));
-                    File.SetAccessControl(path, fs);
-                } else {
-                    continue;
-                }
-
-                string sddl = isDir ? "S:(ML;OICI;NW;;;LW)" : "S:(ML;;NW;;;LW)";
-                IntPtr pSD = IntPtr.Zero;
-                uint sdSize = 0;
-                if (ConvertStringSecurityDescriptorToSecurityDescriptor(sddl, 1, out pSD, out sdSize)) {
-                    bool saclPresent = false;
-                    IntPtr pSacl = IntPtr.Zero;
-                    bool saclDefaulted = false;
-                    if (GetSecurityDescriptorSacl(pSD, out saclPresent, out pSacl, out saclDefaulted) && saclPresent) {
-                        uint result = SetNamedSecurityInfo(path, SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, pSacl);
-                        if (result != 0) {
-                            Console.Error.WriteLine("Warning: SetNamedSecurityInfo failed for " + path + " with error " + result);
-                        }
-                    }
-                    LocalFree(pSD);
-                }
+                ApplyAllowAcl(path, lowSid);
             } catch (Exception e) {
                 Console.Error.WriteLine("Warning: Failed to apply allow ACL to " + path + ": " + e.Message);
             }
+        }
+    }
+
+    private static void ApplyDenyAcl(string path, SecurityIdentifier lowSid) {
+        if (File.Exists(path)) {
+            FileSecurity fs = File.GetAccessControl(path);
+            fs.AddAccessRule(new FileSystemAccessRule(lowSid, FileSystemRights.FullControl, AccessControlType.Deny));
+            File.SetAccessControl(path, fs);
+        } else if (Directory.Exists(path)) {
+            DirectorySecurity ds = Directory.GetAccessControl(path);
+            ds.AddAccessRule(new FileSystemAccessRule(lowSid, FileSystemRights.FullControl, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Deny));
+            Directory.SetAccessControl(path, ds);
+        }
+    }
+
+    private static void ApplyAllowAcl(string path, SecurityIdentifier lowSid) {
+        bool isDirectory = Directory.Exists(path);
+        if (isDirectory) {
+            DirectorySecurity ds = Directory.GetAccessControl(path);
+            ds.AddAccessRule(new FileSystemAccessRule(lowSid, FileSystemRights.Modify, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+            Directory.SetAccessControl(path, ds);
+        } else if (File.Exists(path)) {
+            FileSecurity fs = File.GetAccessControl(path);
+            fs.AddAccessRule(new FileSystemAccessRule(lowSid, FileSystemRights.Modify, AccessControlType.Allow));
+            File.SetAccessControl(path, fs);
+        } else {
+            return;
+        }
+
+        ApplyLowIntegrityLabel(path, isDirectory);
+    }
+
+    private static void ApplyLowIntegrityLabel(string path, bool isDirectory) {
+        string sddl = isDirectory ? "S:(ML;OICI;NW;;;LW)" : "S:(ML;;NW;;;LW)";
+        IntPtr pSD = IntPtr.Zero;
+        uint sdSize = 0;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptor(sddl, 1, out pSD, out sdSize)) {
+            bool saclPresent = false;
+            IntPtr pSacl = IntPtr.Zero;
+            bool saclDefaulted = false;
+            if (GetSecurityDescriptorSacl(pSD, out saclPresent, out pSacl, out saclDefaulted) && saclPresent) {
+                uint result = SetNamedSecurityInfo(path, SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, pSacl);
+                if (result != 0) {
+                    Console.Error.WriteLine("Warning: SetNamedSecurityInfo failed for " + path + " with error " + result);
+                }
+            }
+            LocalFree(pSD);
         }
     }
 

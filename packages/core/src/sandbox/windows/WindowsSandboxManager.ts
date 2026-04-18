@@ -413,17 +413,17 @@ export class WindowsSandboxManager implements SandboxManager {
       path.join(os.tmpdir(), 'gemini-cli-sandbox-'),
     );
 
-    const forbiddenManifestPath = path.join(tempDir, 'forbidden.txt');
-    fs.writeFileSync(
-      forbiddenManifestPath,
-      Array.from(forbiddenManifest).join('\n'),
-    );
+    const writeManifest = (fileName: string, paths: Iterable<string>) => {
+      const manifestPath = path.join(tempDir, fileName);
+      fs.writeFileSync(manifestPath, Array.from(paths).join('\n'));
+      return manifestPath;
+    };
 
-    const allowedManifestPath = path.join(tempDir, 'allowed.txt');
-    fs.writeFileSync(
-      allowedManifestPath,
-      Array.from(allowedManifest).join('\n'),
+    const forbiddenManifestPath = writeManifest(
+      'forbidden.txt',
+      forbiddenManifest,
     );
+    const allowedManifestPath = writeManifest('allowed.txt', allowedManifest);
 
     // 6. Construct the helper command
     const program = this.helperPath;
