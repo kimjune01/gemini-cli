@@ -30,6 +30,20 @@ import {
 } from '../telemetry/constants.js';
 import { AGENT_TOOL_NAME } from '../tools/tool-names.js';
 
+function getAgentInputKey(schema: unknown): string | undefined {
+  if (!isRecord(schema)) {
+    return undefined;
+  }
+
+  const properties = schema['properties'];
+  if (!isRecord(properties)) {
+    return undefined;
+  }
+
+  const keys = Object.keys(properties);
+  return keys.length === 1 ? keys[0] : 'prompt';
+}
+
 /**
  * A unified tool for invoking subagents.
  *
@@ -104,18 +118,8 @@ export class AgentTool extends BaseDeclarativeTool<
   }
 
   private mapParams(prompt: string, schema: unknown): AgentInputs {
-    const schemaObj: unknown = schema;
-    if (!isRecord(schemaObj)) {
-      return { prompt };
-    }
-    const properties = schemaObj['properties'];
-    if (isRecord(properties)) {
-      const keys = Object.keys(properties);
-      if (keys.length === 1) {
-        return { [keys[0]]: prompt };
-      }
-    }
-    return { prompt };
+    const inputKey = getAgentInputKey(schema) ?? 'prompt';
+    return { [inputKey]: prompt };
   }
 }
 
@@ -177,11 +181,15 @@ class DelegateInvocation extends BaseToolInvocation<
     }
   }
 
+  private buildHintedChildInvocation(): ToolInvocation<AgentInputs, ToolResult> {
+    const hintedParams = this.withUserHints(this.mappedInputs);
+    return this.buildChildInvocation(hintedParams);
+  }
+
   override async shouldConfirmExecute(
     abortSignal: AbortSignal,
   ): Promise<ToolCallConfirmationDetails | false> {
-    const hintedParams = this.withUserHints(this.mappedInputs);
-    const invocation = this.buildChildInvocation(hintedParams);
+    const invocation = this.buildHintedChildInvocation();
     return invocation.shouldConfirmExecute(abortSignal);
   }
 
@@ -189,8 +197,7 @@ class DelegateInvocation extends BaseToolInvocation<
     signal: AbortSignal,
     updateOutput?: (output: ToolLiveOutput) => void,
   ): Promise<ToolResult> {
-    const hintedParams = this.withUserHints(this.mappedInputs);
-    const invocation = this.buildChildInvocation(hintedParams);
+    const invocation = this.buildHintedChildInvocation();
 
     return runInDevTraceSpan(
       {
@@ -224,27 +231,19 @@ class DelegateInvocation extends BaseToolInvocation<
       return agentArgs;
     }
 
-    // Find the primary key to append hints to
-    const schemaObj: unknown = this.definition.inputConfig.inputSchema;
-    if (!isRecord(schemaObj)) {
+    const primaryKey = getAgentInputKey(this.definition.inputConfig.inputSchema);
+    if (!primaryKey) {
       return agentArgs;
     }
-    const properties = schemaObj['properties'];
-    if (isRecord(properties)) {
-      const keys = Object.keys(properties);
-      const primaryKey = keys.length === 1 ? keys[0] : 'prompt';
 
-      const value = agentArgs[primaryKey];
-      if (typeof value !== 'string' || value.trim().length === 0) {
-        return agentArgs;
-      }
-
-      return {
-        ...agentArgs,
-        [primaryKey]: `${formattedHints}\n\n${value}`,
-      };
+    const value = agentArgs[primaryKey];
+    if (typeof value !== 'string' || value.trim().length === 0) {
+      return agentArgs;
     }
 
-    return agentArgs;
+    return {
+      ...agentArgs,
+      [primaryKey]: `${formattedHints}\n\n${value}`,
+    };
   }
 }
