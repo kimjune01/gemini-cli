@@ -17,7 +17,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import {
-  Config,
+  type Config,
   type ConfigParameters,
   AuthType,
   ApprovalMode,
@@ -91,6 +91,8 @@ export class ComponentRig {
 
     // Refresh auth using USE_GEMINI to initialize the real BaseLlmClient
     await this.config.refreshAuth(AuthType.USE_GEMINI);
+
+    return this.config;
   }
 
   async cleanup() {
@@ -99,7 +101,7 @@ export class ComponentRig {
 }
 
 /**
- * A helper for running behavioral evaluations directly against backend components.
+ * A helper for running component-level evaluations directly against backend components.
  * It provides a fully initialized Config with real API access, bypassing the UI.
  */
 export function componentEvalTest(
@@ -115,17 +117,17 @@ export function componentEvalTest(
       await prepareLogDir(evalCase.name);
 
       try {
-        await rig.initialize();
+        const config = await rig.initialize();
 
         if (evalCase.files) {
           await prepareWorkspace(rig.testDir, rig.testDir, evalCase.files);
         }
 
         if (evalCase.setup) {
-          await evalCase.setup(rig.config!);
+          await evalCase.setup(config);
         }
 
-        await evalCase.assert(rig.config!);
+        await evalCase.assert(config);
       } finally {
         await rig.cleanup();
       }
