@@ -81,82 +81,84 @@ class DiscoveredToolInvocation extends BaseToolInvocation<
       cleanupFunc = prepared.cleanup;
     }
 
-    const child = spawn(finalCommand, finalArgs, {
-      env: finalEnv,
-    });
-    child.stdin.write(JSON.stringify(this.params));
-    child.stdin.end();
+    try {
+      const child = spawn(finalCommand, finalArgs, {
+        env: finalEnv,
+      });
+      child.stdin.write(JSON.stringify(this.params));
+      child.stdin.end();
 
-    let stdout = '';
-    let stderr = '';
-    let error: Error | null = null;
-    let code: number | null = null;
-    let signal: NodeJS.Signals | null = null;
+      let stdout = '';
+      let stderr = '';
+      let error: Error | null = null;
+      let code: number | null = null;
+      let signal: NodeJS.Signals | null = null;
 
-    await new Promise<void>((resolve) => {
-      const onStdout = (data: Buffer) => {
-        stdout += data?.toString();
-      };
+      await new Promise<void>((resolve) => {
+        const onStdout = (data: Buffer) => {
+          stdout += data?.toString();
+        };
 
-      const onStderr = (data: Buffer) => {
-        stderr += data?.toString();
-      };
+        const onStderr = (data: Buffer) => {
+          stderr += data?.toString();
+        };
 
-      const onError = (err: Error) => {
-        cleanupFunc?.();
-        error = err;
-      };
+        const onError = (err: Error) => {
+          error = err;
+        };
 
-      const onClose = (
-        _code: number | null,
-        _signal: NodeJS.Signals | null,
-      ) => {
-        cleanupFunc?.();
-        code = _code;
-        signal = _signal;
-        cleanup();
-        resolve();
-      };
+        const onClose = (
+          _code: number | null,
+          _signal: NodeJS.Signals | null,
+        ) => {
+          code = _code;
+          signal = _signal;
+          cleanup();
+          resolve();
+        };
 
-      const cleanup = () => {
-        child.stdout.removeListener('data', onStdout);
-        child.stderr.removeListener('data', onStderr);
-        child.removeListener('error', onError);
-        child.removeListener('close', onClose);
-        if (child.connected) {
-          child.disconnect();
-        }
-      };
+        const cleanup = () => {
+          child.stdout.removeListener('data', onStdout);
+          child.stderr.removeListener('data', onStderr);
+          child.removeListener('error', onError);
+          child.removeListener('close', onClose);
+          if (child.connected) {
+            child.disconnect();
+          }
+        };
 
-      child.stdout.on('data', onStdout);
-      child.stderr.on('data', onStderr);
-      child.on('error', onError);
-      child.on('close', onClose);
-    });
+        child.stdout.on('data', onStdout);
+        child.stderr.on('data', onStderr);
+        child.on('error', onError);
+        child.on('close', onClose);
+      });
 
-    // if there is any error, non-zero exit code, signal, or stderr, return error details instead of stdout
-    if (error || code !== 0 || signal || stderr) {
-      const llmContent = [
-        `Stdout: ${stdout || '(empty)'}`,
-        `Stderr: ${stderr || '(empty)'}`,
-        `Error: ${error ?? '(none)'}`,
-        `Exit Code: ${code ?? '(none)'}`,
-        `Signal: ${signal ?? '(none)'}`,
-      ].join('\n');
+      // if there is any error, non-zero exit code, signal, or stderr, return error details instead of stdout
+      if (error || code !== 0 || signal || stderr) {
+        const llmContent = [
+          `Stdout: ${stdout || '(empty)'}`,
+          `Stderr: ${stderr || '(empty)'}`,
+          `Error: ${error ?? '(none)'}`,
+          `Exit Code: ${code ?? '(none)'}`,
+          `Signal: ${signal ?? '(none)'}`,
+        ].join('\n');
+        return {
+          llmContent,
+          returnDisplay: llmContent,
+          error: {
+            message: llmContent,
+            type: ToolErrorType.DISCOVERED_TOOL_EXECUTION_ERROR,
+          },
+        };
+      }
+
       return {
-        llmContent,
-        returnDisplay: llmContent,
-        error: {
-          message: llmContent,
-          type: ToolErrorType.DISCOVERED_TOOL_EXECUTION_ERROR,
-        },
+        llmContent: stdout,
+        returnDisplay: stdout,
       };
+    } finally {
+      cleanupFunc?.();
     }
-
-    return {
-      llmContent: stdout,
-      returnDisplay: stdout,
-    };
   }
 }
 
@@ -430,37 +432,41 @@ export class ToolRegistry {
         stderr += stderrDecoder.write(data);
       });
 
-      await new Promise<void>((resolve, reject) => {
-        proc.on('error', (err) => {
-          cleanupFunc?.();
-          reject(err);
-        });
-        proc.on('close', (code) => {
-          cleanupFunc?.();
-          stdout += stdoutDecoder.end();
-          stderr += stderrDecoder.end();
+      try {
+        await new Promise<void>((resolve, reject) => {
+          proc.on('error', (err) => {
+            reject(err);
+          });
+          proc.on('close', (code) => {
+            stdout += stdoutDecoder.end();
+            stderr += stderrDecoder.end();
 
-          if (sizeLimitExceeded) {
-            return reject(
-              new Error(
-                `Tool discovery command output exceeded size limit of ${MAX_STDOUT_SIZE} bytes.`,
-              ),
-            );
-          }
+            if (sizeLimitExceeded) {
+              return reject(
+                new Error(
+                  `Tool discovery command output exceeded size limit of ${MAX_STDOUT_SIZE} bytes.`,
+                ),
+              );
+            }
 
-          if (code !== 0) {
-            coreEvents.emitFeedback(
-              'error',
-              `Tool discovery command failed with code ${code}.`,
-              stderr,
-            );
-            return reject(
-              new Error(`Tool discovery command failed with exit code ${code}`),
-            );
-          }
-          resolve();
+            if (code !== 0) {
+              coreEvents.emitFeedback(
+                'error',
+                `Tool discovery command failed with code ${code}.`,
+                stderr,
+              );
+              return reject(
+                new Error(
+                  `Tool discovery command failed with exit code ${code}`,
+                ),
+              );
+            }
+            resolve();
+          });
         });
-      });
+      } finally {
+        cleanupFunc?.();
+      }
 
       // execute discovery command and extract function declarations (w/ or w/o "tool" wrappers)
       const functions: FunctionDeclaration[] = [];
